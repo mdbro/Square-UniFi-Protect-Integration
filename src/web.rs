@@ -94,8 +94,28 @@ impl AppState {
         }
         let state = self.clone();
         tokio::spawn(async move {
-            state.schedule_maintenance(false).await;
+            state
+                .run_maintenance_scheduler(Duration::from_secs(60))
+                .await;
         });
+    }
+
+    async fn run_maintenance_scheduler(self, retry_interval: Duration) {
+        self.schedule_maintenance(false).await;
+        let mut timer = tokio::time::interval(retry_interval);
+        timer.tick().await;
+        loop {
+            timer.tick().await;
+            match self.store.orphan_thumbnail_cleanup_pending() {
+                Ok(true) => {
+                    self.schedule_maintenance(false).await;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "could not check pending thumbnail cleanup");
+                }
+            }
+        }
     }
 
     async fn schedule_maintenance(&self, optimize_existing: bool) -> bool {
@@ -902,21 +922,47 @@ async fn set_square(
             "Webhook signature key and notification URL must be provided together".into(),
         ));
     }
+    if !body.webhook_url.is_empty() {
+        validate_https_url(&body.webhook_url)?;
+    }
     let square = SquareClient::new(&body.access_token, &body.environment)?;
     let locations = square.list_locations().await?;
     let merchant_id = square.merchant_id().await?;
     square.payment_page(None, None, None, 1).await?;
-    let _provider_guard = state.store.integration_guard(true)?;
-    let old_merchant = state.store.get_setting("square.merchant_id")?;
-    let switched = old_merchant
+    save_verified_square_account(&state, body, locations, merchant_id)
+}
+
+fn square_account_changed(
+    state: &AppState,
+    merchant_id: &str,
+    environment: &str,
+) -> AppResult<bool> {
+    let old = state
+        .store
+        .get_settings(["square.merchant_id", "square.environment"])?;
+    Ok(old["square.merchant_id"]
         .as_deref()
-        .is_some_and(|value| !value.is_empty() && value != merchant_id);
+        .is_some_and(|value| !value.is_empty() && value != merchant_id)
+        || old["square.environment"]
+            .as_deref()
+            .is_some_and(|value| value != environment))
+}
+
+fn save_verified_square_account(
+    state: &AppState,
+    body: SquareSettingsBody,
+    locations: Vec<Value>,
+    merchant_id: String,
+) -> AppResult<Response> {
+    let _provider_guard = state.store.integration_guard(true)?;
+    let switched = square_account_changed(state, &merchant_id, &body.environment)?;
     if switched && !body.confirm_account_switch {
         let token = new_session_token();
         state.store.update_settings(
             &[
                 ("square.switch_token", &token, true),
                 ("square.switch_merchant", &merchant_id, false),
+                ("square.switch_environment", &body.environment, false),
                 (
                     "square.switch_expires_at",
                     &(now_millis() + 300_000).to_string(),
@@ -929,7 +975,7 @@ async fn set_square(
             StatusCode::CONFLICT,
             json!({"detail": {
                 "code": "square_account_switch_confirmation_required",
-                "message": "These credentials belong to a different Square account. Confirm the account switch to erase the previous account's local transactions, thumbnails, POS devices, camera mappings, sync history, and saved Square webhook credentials.",
+                "message": "These credentials belong to a different Square account or environment. Confirm the account switch to erase the previous account's local transactions, thumbnails, POS devices, camera mappings, sync history, and saved Square webhook credentials.",
                 "confirmation_token": token,
             }}),
         ));
@@ -948,16 +994,20 @@ async fn set_square(
             .get_setting("square.switch_expires_at")?
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
+        let target_environment = state.store.get_setting("square.switch_environment")?;
         let presented = body.account_switch_confirmation_token.as_bytes();
         let stored_token = stored.as_bytes();
         let token_matches =
             stored_token.len() == presented.len() && bool::from(stored_token.ct_eq(presented));
-        if !token_matches || target != merchant_id || expiry < now_millis() {
+        if !token_matches
+            || target != merchant_id
+            || target_environment.as_deref() != Some(body.environment.as_str())
+            || expiry < now_millis()
+        {
             return Err(AppError::Conflict(
                 "Square account switch confirmation expired; reconnect and confirm again".into(),
             ));
         }
-        state.store.clear_square_account_data_under_guard()?;
     }
     let revision = new_session_token();
     let mut owned = vec![
@@ -968,7 +1018,6 @@ async fn set_square(
     ];
     let delete_webhook = body.clear_webhook || switched;
     if !body.webhook_signature_key.is_empty() {
-        validate_https_url(&body.webhook_url)?;
         owned.push((
             "square.webhook_signature_key",
             body.webhook_signature_key.clone(),
@@ -983,6 +1032,7 @@ async fn set_square(
     let mut deletes = vec![
         "square.switch_token",
         "square.switch_merchant",
+        "square.switch_environment",
         "square.switch_expires_at",
         "square.refresh_token",
         "square.token_expires_at",
@@ -991,19 +1041,25 @@ async fn set_square(
     if delete_webhook && body.webhook_signature_key.is_empty() {
         deletes.extend(["square.webhook_signature_key", "square.webhook_url"]);
     }
-    state.store.update_settings(&updates, &deletes)?;
-    state.store.clear_oauth_states()?;
-    let webhook_configured = state
+    if delete_webhook || !body.webhook_signature_key.is_empty() {
+        deletes.push("square.webhook_subscription_id");
+    }
+    let webhook_configured = !body.webhook_signature_key.is_empty()
+        || (!delete_webhook
+            && state
+                .store
+                .get_setting("square.webhook_signature_key")?
+                .is_some_and(|value| !value.is_empty()));
+    let evidence_cleanup_pending = state
         .store
-        .get_setting("square.webhook_signature_key")?
-        .is_some_and(|value| !value.is_empty());
+        .save_square_account_under_guard(&updates, &deletes, switched)?;
     Ok(json_response(json!({
         "ok": true,
         "locations": locations,
         "account_switched": switched,
         "webhook_configured": webhook_configured,
         "account_revision": revision,
-        "evidence_cleanup_pending": false,
+        "evidence_cleanup_pending": evidence_cleanup_pending,
     })))
 }
 
@@ -1317,11 +1373,7 @@ async fn square_oauth_callback(
         .unwrap_or("");
     let square = SquareClient::new(access, &environment)?;
     let merchant = square.merchant_id().await?;
-    let old = state.store.get_setting("square.merchant_id")?;
-    if old
-        .as_deref()
-        .is_some_and(|value| !value.is_empty() && value != merchant)
-    {
+    if square_account_changed(&state, &merchant, &environment)? {
         state.store.update_settings(
             &[
                 ("square.oauth_pending_access_token", access, true),
@@ -1340,7 +1392,7 @@ async fn square_oauth_callback(
         return Ok(Redirect::to("/?square_oauth=switch_required").into_response());
     }
     let revision = new_session_token();
-    state.store.update_settings(
+    state.store.save_square_account_under_guard(
         &[
             ("square.access_token", access, true),
             ("square.refresh_token", refresh, true),
@@ -1350,6 +1402,7 @@ async fn square_oauth_callback(
             (SQUARE_ACCOUNT_REVISION_SETTING, &revision, false),
         ],
         &[],
+        false,
     )?;
     Ok(Redirect::to("/?square_oauth=connected").into_response())
 }
@@ -1396,9 +1449,9 @@ async fn confirm_oauth_switch(
             "The pending Square authorization expired; connect again".into(),
         ));
     }
-    state.store.clear_square_account_data_under_guard()?;
+    SquareClient::new(&access, &environment)?;
     let revision = new_session_token();
-    state.store.update_settings(
+    let evidence_cleanup_pending = state.store.save_square_account_under_guard(
         &[
             ("square.access_token", &access, true),
             ("square.refresh_token", &refresh, true),
@@ -1408,10 +1461,13 @@ async fn confirm_oauth_switch(
             (SQUARE_ACCOUNT_REVISION_SETTING, &revision, false),
         ],
         &oauth_pending_keys(),
+        true,
     )?;
-    Ok(json_response(
-        json!({"ok": true, "account_revision": revision}),
-    ))
+    Ok(json_response(json!({
+        "ok": true,
+        "account_revision": revision,
+        "evidence_cleanup_pending": evidence_cleanup_pending,
+    })))
 }
 
 async fn cancel_oauth_switch(
@@ -3445,6 +3501,390 @@ mod tests {
         assert!(csv.contains("'@4242"));
         assert!(csv.contains("'=review this"));
         assert!(!csv.contains("raw"));
+    }
+
+    fn seed_square_account(state: &AppState) {
+        state
+            .store
+            .update_settings(
+                &[
+                    ("square.access_token", "test-old-access", true),
+                    ("square.environment", "sandbox", false),
+                    ("square.merchant_id", "MERCHANT_OLD", false),
+                    ("square.webhook_signature_key", "test-old-key", true),
+                    ("square.webhook_url", "https://example.com/old-hook", false),
+                    ("square.webhook_subscription_id", "SUB_OLD", false),
+                ],
+                &[],
+            )
+            .unwrap();
+        state
+            .store
+            .replace_camera_mappings(&[CameraMappingEntry {
+                location_id: "LOC_OLD".into(),
+                device_id: String::new(),
+                device_name: String::new(),
+                camera_id: "cam1aaaaaaaaaaaaaaaaaaaa".into(),
+                camera_name: "Test camera".into(),
+            }])
+            .unwrap();
+        state
+            .store
+            .upsert_payment(
+                &crate::clients::parse_payment(&json!({
+                    "id": "PAY_OLD", "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z", "status": "COMPLETED",
+                    "amount_money": {"amount": 100, "currency": "USD"}, "location_id": "LOC_OLD",
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        state
+            .store
+            .record_webhook_receipt(&"c".repeat(64), "payment.created", now_millis(), None)
+            .unwrap();
+        std::fs::write(state.store.thumbnail_dir().join("old.jpg"), b"old image").unwrap();
+    }
+
+    fn stage_square_oauth_switch(state: &AppState) {
+        state
+            .store
+            .update_settings(
+                &[
+                    ("square.oauth_pending_access_token", "test-new-access", true),
+                    (
+                        "square.oauth_pending_refresh_token",
+                        "test-new-refresh",
+                        true,
+                    ),
+                    (
+                        "square.oauth_pending_expires_at",
+                        "2027-01-01T00:00:00Z",
+                        false,
+                    ),
+                    ("square.oauth_pending_merchant_id", "MERCHANT_NEW", false),
+                    ("square.oauth_pending_environment", "production", false),
+                    (
+                        "square.oauth_pending_created_at_ms",
+                        &now_millis().to_string(),
+                        false,
+                    ),
+                ],
+                &[],
+            )
+            .unwrap();
+    }
+
+    fn square_settings_body() -> SquareSettingsBody {
+        serde_json::from_value(json!({
+            "access_token": "test-new-access", "environment": "production",
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn square_rejects_invalid_webhook_url_before_credentials_or_account_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, cookie) = authenticated_state(temp.path().to_path_buf());
+        seed_square_account(&state);
+        let response = build_router(state.clone()).oneshot(http_request(
+            "PUT", "/api/settings/square", json!({
+                // Invalid credentials also keep this test offline if validation regresses.
+                "access_token": "\n", "environment": "production",
+                "webhook_signature_key": "test-new-key", "webhook_url": "http://example.com/hook",
+                "confirm_account_switch": true,
+            }), Some(&cookie),
+        )).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = response_json_value(response).await;
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with("Notification URL")
+        );
+        assert!(state.store.get_transaction("PAY_OLD").unwrap().is_some());
+        assert_eq!(state.store.get_camera_mappings().unwrap().len(), 1);
+        assert_eq!(
+            state
+                .store
+                .get_setting("square.access_token")
+                .unwrap()
+                .as_deref(),
+            Some("test-old-access")
+        );
+        assert!(state.store.thumbnail_dir().join("old.jpg").exists());
+    }
+
+    #[tokio::test]
+    async fn square_manual_switch_confirms_environment_and_replaces_account_configuration() {
+        for (merchant, replace_webhook, fail_cleanup) in [
+            ("MERCHANT_NEW", false, true),
+            ("MERCHANT_NEW", true, false),
+            ("MERCHANT_OLD", false, false),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let state = test_state(temp.path().to_path_buf());
+            seed_square_account(&state);
+            let error = save_verified_square_account(
+                &state,
+                square_settings_body(),
+                vec![],
+                merchant.into(),
+            )
+            .unwrap_err();
+            let response = error.into_response();
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let challenge = response_json_value(response).await;
+            let token = challenge["detail"]["confirmation_token"].as_str().unwrap();
+            assert!(state.store.get_transaction("PAY_OLD").unwrap().is_some());
+            if merchant == "MERCHANT_NEW" {
+                let mut wrong_environment = square_settings_body();
+                wrong_environment.environment = "sandbox".into();
+                wrong_environment.confirm_account_switch = true;
+                wrong_environment.account_switch_confirmation_token = token.into();
+                assert!(matches!(
+                    save_verified_square_account(
+                        &state,
+                        wrong_environment,
+                        vec![],
+                        merchant.into(),
+                    ),
+                    Err(AppError::Conflict(_))
+                ));
+            }
+            if fail_cleanup {
+                std::fs::rename(
+                    state.store.thumbnail_dir(),
+                    temp.path().join("saved-thumbnails"),
+                )
+                .unwrap();
+                std::fs::write(state.store.thumbnail_dir(), b"not a directory").unwrap();
+            }
+            let mut body = square_settings_body();
+            body.confirm_account_switch = true;
+            body.account_switch_confirmation_token = token.into();
+            if replace_webhook {
+                body.webhook_signature_key = "test-new-key".into();
+                body.webhook_url = "https://example.com/new-hook".into();
+            }
+            let response =
+                save_verified_square_account(&state, body, vec![], merchant.into()).unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let saved = response_json_value(response).await;
+            assert_eq!(saved["account_switched"], true);
+            assert_eq!(saved["evidence_cleanup_pending"], fail_cleanup);
+            assert_eq!(saved["webhook_configured"], replace_webhook);
+            assert!(state.store.get_transaction("PAY_OLD").unwrap().is_none());
+            assert!(state.store.get_camera_mappings().unwrap().is_empty());
+            assert_eq!(
+                state
+                    .store
+                    .get_setting("square.access_token")
+                    .unwrap()
+                    .as_deref(),
+                Some("test-new-access")
+            );
+            assert_eq!(
+                state
+                    .store
+                    .get_setting("square.environment")
+                    .unwrap()
+                    .as_deref(),
+                Some("production")
+            );
+            assert_eq!(
+                state
+                    .store
+                    .get_setting("square.webhook_signature_key")
+                    .unwrap()
+                    .as_deref(),
+                replace_webhook.then_some("test-new-key")
+            );
+            assert_eq!(
+                state
+                    .store
+                    .get_setting("square.webhook_url")
+                    .unwrap()
+                    .as_deref(),
+                replace_webhook.then_some("https://example.com/new-hook")
+            );
+            assert!(
+                state
+                    .store
+                    .get_setting("square.webhook_subscription_id")
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                state.store.webhook_metrics().unwrap()["accepted_payment_count"],
+                0
+            );
+            assert_eq!(
+                state.store.orphan_thumbnail_cleanup_pending().unwrap(),
+                fail_cleanup
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn square_oauth_switch_database_failure_keeps_old_account_and_pending_authorization() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, cookie) = authenticated_state(temp.path().to_path_buf());
+        seed_square_account(&state);
+        stage_square_oauth_switch(&state);
+        let connection = rusqlite::Connection::open(temp.path().join("spi.db")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_account_save BEFORE INSERT ON settings \
+             WHEN NEW.key='square.access_token' \
+             BEGIN SELECT RAISE(ABORT, 'injected database failure'); END;",
+            )
+            .unwrap();
+        let app = build_router(state.clone());
+        let response = app
+            .clone()
+            .oneshot(http_request(
+                "POST",
+                "/api/settings/square/oauth-switch/confirm",
+                json!({}),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(state.store.get_transaction("PAY_OLD").unwrap().is_some());
+        assert_eq!(state.store.get_camera_mappings().unwrap().len(), 1);
+        assert_eq!(
+            state
+                .store
+                .get_setting("square.access_token")
+                .unwrap()
+                .as_deref(),
+            Some("test-old-access")
+        );
+        assert_eq!(
+            state
+                .store
+                .get_setting("square.webhook_signature_key")
+                .unwrap()
+                .as_deref(),
+            Some("test-old-key")
+        );
+        assert_eq!(
+            state
+                .store
+                .get_setting("square.oauth_pending_access_token")
+                .unwrap()
+                .as_deref(),
+            Some("test-new-access")
+        );
+        assert!(state.store.thumbnail_dir().join("old.jpg").exists());
+        connection
+            .execute_batch("DROP TRIGGER fail_account_save")
+            .unwrap();
+        let response = app
+            .oneshot(http_request(
+                "POST",
+                "/api/settings/square/oauth-switch/confirm",
+                json!({}),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json_value(response).await["evidence_cleanup_pending"],
+            false
+        );
+        assert!(state.store.get_transaction("PAY_OLD").unwrap().is_none());
+        assert!(!state.store.thumbnail_dir().join("old.jpg").exists());
+    }
+
+    #[tokio::test]
+    async fn square_oauth_switch_clears_webhooks_and_retries_cleanup_without_polling() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, cookie) = authenticated_state(temp.path().to_path_buf());
+        seed_square_account(&state);
+        stage_square_oauth_switch(&state);
+        let displaced = temp.path().join("saved-thumbnails");
+        std::fs::rename(state.store.thumbnail_dir(), &displaced).unwrap();
+        std::fs::write(state.store.thumbnail_dir(), b"not a directory").unwrap();
+        let response = build_router(state.clone())
+            .oneshot(http_request(
+                "POST",
+                "/api/settings/square/oauth-switch/confirm",
+                json!({}),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json_value(response).await["evidence_cleanup_pending"],
+            true
+        );
+        assert!(state.store.get_transaction("PAY_OLD").unwrap().is_none());
+        assert!(state.store.get_camera_mappings().unwrap().is_empty());
+        assert_eq!(
+            state
+                .store
+                .get_setting("square.access_token")
+                .unwrap()
+                .as_deref(),
+            Some("test-new-access")
+        );
+        assert_eq!(
+            state
+                .store
+                .get_setting("square.environment")
+                .unwrap()
+                .as_deref(),
+            Some("production")
+        );
+        for key in [
+            "square.webhook_signature_key",
+            "square.webhook_url",
+            "square.webhook_subscription_id",
+            "square.oauth_pending_access_token",
+        ] {
+            assert!(state.store.get_setting(key).unwrap().is_none(), "{key}");
+        }
+        assert_eq!(
+            state.store.webhook_metrics().unwrap()["accepted_payment_count"],
+            0
+        );
+        assert!(state.config.poll_interval.is_none());
+        let scheduler = tokio::spawn(
+            state
+                .clone()
+                .run_maintenance_scheduler(Duration::from_millis(20)),
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if state.maintenance.read().await["state"] == "complete" {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(state.store.orphan_thumbnail_cleanup_pending().unwrap());
+        std::fs::remove_file(state.store.thumbnail_dir()).unwrap();
+        std::fs::rename(&displaced, state.store.thumbnail_dir()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while state.store.orphan_thumbnail_cleanup_pending().unwrap()
+                || state.maintenance_queue.lock().await.active
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        scheduler.abort();
+        let _ = scheduler.await;
+        assert!(!state.store.thumbnail_dir().join("old.jpg").exists());
     }
 
     #[tokio::test]

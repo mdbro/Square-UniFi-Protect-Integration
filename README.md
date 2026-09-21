@@ -167,6 +167,12 @@ Then:
    (subscribe the webhook to both `payment.created` and `payment.updated`, pointing at
    `https://<your-host>:3546/webhooks/square`). Existing installations must reconnect
    Square once after upgrading so webhook events can be bound to that merchant.
+   Changing the merchant or switching between Sandbox and Production requires
+   confirmation and clears the previous account's local transactions, camera
+   mappings, sync history, and webhook configuration. Re-map the production
+   cameras and configure its webhook afterward. If old thumbnail files cannot
+   be removed immediately, the account switch still completes and cleanup
+   retries automatically, including after a restart.
 4. **Settings → POS camera** — pick the camera that watches each location's
    register.
 5. **Settings → Thumbnail storage** — optionally enable JPEG compression and

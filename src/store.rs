@@ -415,33 +415,55 @@ impl Store {
 
     pub fn clear_square_account_data(&self) -> AppResult<()> {
         let _guard = self.integration_guard(true)?;
-        self.clear_square_account_data_under_guard()
+        self.save_square_account_under_guard(&[], &[], true)
+            .map(|_| ())
     }
 
-    pub fn clear_square_account_data_under_guard(&self) -> AppResult<()> {
+    /// Save verified credentials while holding the exclusive integration guard.
+    /// Account data and settings change together; the result reports whether
+    /// unreferenced thumbnail files still need cleanup after the commit.
+    pub fn save_square_account_under_guard(
+        &self,
+        updates: &[(&str, &str, bool)],
+        delete_keys: &[&str],
+        account_switched: bool,
+    ) -> AppResult<bool> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
-        transaction.execute("DELETE FROM transactions", [])?;
-        transaction.execute("DELETE FROM camera_map", [])?;
-        transaction.execute("DELETE FROM square_poll_watermarks", [])?;
-        transaction.execute("DELETE FROM square_webhook_receipts", [])?;
-        transaction.execute("DELETE FROM transaction_feed_snapshots", [])?;
-        transaction.execute("DELETE FROM transaction_feed_order_history", [])?;
-        write_plain_setting(
-            &transaction,
-            "maintenance.orphan_thumbnail_cleanup_pending",
-            1,
-        )?;
+        if account_switched {
+            transaction.execute("DELETE FROM transactions", [])?;
+            transaction.execute("DELETE FROM camera_map", [])?;
+            transaction.execute("DELETE FROM square_poll_watermarks", [])?;
+            transaction.execute("DELETE FROM square_webhook_receipts", [])?;
+            transaction.execute("DELETE FROM transaction_feed_snapshots", [])?;
+            transaction.execute("DELETE FROM transaction_feed_order_history", [])?;
+            transaction.execute(
+                "DELETE FROM settings WHERE key IN (\
+                 'square.webhook_signature_key', 'square.webhook_url', \
+                 'square.webhook_subscription_id') OR key LIKE 'webhook.%'",
+                [],
+            )?;
+            write_plain_setting(
+                &transaction,
+                "maintenance.orphan_thumbnail_cleanup_pending",
+                1,
+            )?;
+        }
+        for (key, value, secret) in updates {
+            write_setting(&transaction, &self.inner.cipher, key, value, *secret)?;
+        }
+        for key in delete_keys {
+            transaction.execute("DELETE FROM settings WHERE key = ?", [key])?;
+        }
+        transaction.execute("DELETE FROM square_oauth_states", [])?;
         transaction.commit()?;
         drop(connection);
-        for entry in fs::read_dir(&self.inner.thumbnail_dir)? {
-            let entry = entry?;
-            if entry.file_type()?.is_file() && !entry.path().is_symlink() {
-                fs::remove_file(entry.path())?;
-            }
+
+        if account_switched && let Err(error) = self.remove_orphan_thumbnails_under_guard() {
+            tracing::warn!(%error, "Square account switched; thumbnail cleanup deferred");
+            return Ok(true);
         }
-        self.delete_settings(&["maintenance.orphan_thumbnail_cleanup_pending"])?;
-        Ok(())
+        Ok(false)
     }
 
     pub fn suppress_pending_alarms(&self) -> AppResult<()> {
@@ -690,9 +712,7 @@ impl Store {
             }
         }
 
-        if self
-            .get_setting("maintenance.orphan_thumbnail_cleanup_pending")?
-            .is_some()
+        if self.orphan_thumbnail_cleanup_pending()?
             && let Err(error) = self.remove_orphan_thumbnails()
         {
             tracing::warn!(%error, "could not complete thumbnail orphan cleanup");
@@ -832,8 +852,18 @@ impl Store {
         }
     }
 
+    pub fn orphan_thumbnail_cleanup_pending(&self) -> AppResult<bool> {
+        Ok(self
+            .get_setting("maintenance.orphan_thumbnail_cleanup_pending")?
+            .is_some())
+    }
+
     fn remove_orphan_thumbnails(&self) -> AppResult<i64> {
         let _guard = self.integration_guard(true)?;
+        self.remove_orphan_thumbnails_under_guard()
+    }
+
+    fn remove_orphan_thumbnails_under_guard(&self) -> AppResult<i64> {
         let referenced: HashSet<String> = {
             let connection = self.connection()?;
             let mut statement = connection.prepare(

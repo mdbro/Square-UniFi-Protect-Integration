@@ -672,6 +672,179 @@ fn square_account_clear_removes_scoped_rows_watermarks_and_thumbnail_files() {
 }
 
 #[test]
+fn square_account_save_rolls_back_records_credentials_and_oauth_state_together() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(temp.path()).unwrap();
+    store
+        .replace_camera_mappings(&[mapping("LOC_1", "", CAMERA_A)])
+        .unwrap();
+    store.upsert_payment(&payment("PAY_OLD", 0)).unwrap();
+    store
+        .advance_square_poll_watermark("LOC_1", BASE_TS)
+        .unwrap();
+    store
+        .record_webhook_receipt(&"c".repeat(64), "payment.created", BASE_TS, None)
+        .unwrap();
+    store
+        .update_settings(
+            &[
+                ("square.access_token", "test-old-access", true),
+                ("square.environment", "sandbox", false),
+                ("square.webhook_signature_key", "test-old-key", true),
+            ],
+            &[],
+        )
+        .unwrap();
+    store.store_oauth_state("test-state").unwrap();
+    let image = store.thumbnail_dir().join("old.jpg");
+    fs::write(&image, b"old image").unwrap();
+    let connection = rusqlite::Connection::open(temp.path().join("spi.db")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_account_save BEFORE DELETE ON square_oauth_states \
+             BEGIN SELECT RAISE(ABORT, 'injected database failure'); END;",
+        )
+        .unwrap();
+    let result = {
+        let _guard = store.integration_guard(true).unwrap();
+        store.save_square_account_under_guard(
+            &[
+                ("square.access_token", "test-new-access", true),
+                ("square.environment", "production", false),
+            ],
+            &[],
+            true,
+        )
+    };
+    assert!(result.is_err());
+    assert!(store.get_transaction("PAY_OLD").unwrap().is_some());
+    assert_eq!(store.get_camera_mappings().unwrap().len(), 1);
+    assert_eq!(store.square_poll_watermark("LOC_1").unwrap(), Some(BASE_TS));
+    assert!(store.webhook_receipt_exists(&"c".repeat(64)).unwrap());
+    assert_eq!(
+        store.webhook_metrics().unwrap()["accepted_payment_count"],
+        1
+    );
+    assert_eq!(
+        store.get_setting("square.access_token").unwrap().as_deref(),
+        Some("test-old-access")
+    );
+    assert_eq!(
+        store.get_setting("square.environment").unwrap().as_deref(),
+        Some("sandbox")
+    );
+    assert_eq!(
+        store
+            .get_setting("square.webhook_signature_key")
+            .unwrap()
+            .as_deref(),
+        Some("test-old-key")
+    );
+    assert!(!store.orphan_thumbnail_cleanup_pending().unwrap());
+    assert!(image.exists());
+    connection
+        .execute_batch("DROP TRIGGER fail_account_save")
+        .unwrap();
+    assert!(store.consume_oauth_state("test-state").unwrap());
+}
+
+#[test]
+fn square_cleanup_survives_restart_and_preserves_new_account_thumbnails() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(temp.path()).unwrap();
+    fs::write(store.thumbnail_dir().join("old.jpg"), b"old image").unwrap();
+    let displaced = temp.path().join("saved-thumbnails");
+    fs::rename(store.thumbnail_dir(), &displaced).unwrap();
+    fs::write(store.thumbnail_dir(), b"not a directory").unwrap();
+    {
+        let _guard = store.integration_guard(true).unwrap();
+        assert!(
+            store
+                .save_square_account_under_guard(
+                    &[("square.access_token", "test-new-access", true)],
+                    &[],
+                    true,
+                )
+                .unwrap()
+        );
+    }
+    fs::remove_file(store.thumbnail_dir()).unwrap();
+    fs::rename(&displaced, store.thumbnail_dir()).unwrap();
+    drop(store);
+    let store = Store::open(temp.path()).unwrap();
+    assert!(store.orphan_thumbnail_cleanup_pending().unwrap());
+    assert_eq!(
+        store.get_setting("square.access_token").unwrap().as_deref(),
+        Some("test-new-access")
+    );
+    store
+        .replace_camera_mappings(&[mapping("LOC_1", "", CAMERA_A)])
+        .unwrap();
+    store.upsert_payment(&payment("PAY_NEW", 0)).unwrap();
+    fs::write(store.thumbnail_dir().join("new.jpg"), b"new image").unwrap();
+    let jobs = store
+        .claim_due_thumbnail_retries(1, BASE_TS as f64 / 1000.0)
+        .unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert!(
+        store
+            .complete_thumbnail_retry("PAY_NEW", &jobs[0].1, CAMERA_A, BASE_TS, "new.jpg", 9, 0)
+            .unwrap()
+    );
+    store.run_thumbnail_maintenance(false, BASE_TS).unwrap();
+    assert!(!store.orphan_thumbnail_cleanup_pending().unwrap());
+    assert!(!store.thumbnail_dir().join("old.jpg").exists());
+    assert!(store.thumbnail_dir().join("new.jpg").exists());
+    assert_eq!(
+        store
+            .get_transaction("PAY_NEW")
+            .unwrap()
+            .unwrap()
+            .thumbnail_path
+            .as_deref(),
+        Some("new.jpg")
+    );
+}
+
+#[test]
+fn square_reconnect_preserves_account_data_and_webhook_configuration() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Store::open(temp.path()).unwrap();
+    store
+        .replace_camera_mappings(&[mapping("LOC_1", "", CAMERA_A)])
+        .unwrap();
+    store.upsert_payment(&payment("PAY_OLD", 0)).unwrap();
+    store
+        .set_setting("square.webhook_signature_key", "test-old-key", true)
+        .unwrap();
+    store.store_oauth_state("test-state").unwrap();
+    let _guard = store.integration_guard(true).unwrap();
+    assert!(
+        !store
+            .save_square_account_under_guard(
+                &[("square.access_token", "test-new-access", true)],
+                &[],
+                false,
+            )
+            .unwrap()
+    );
+    assert!(store.get_transaction("PAY_OLD").unwrap().is_some());
+    assert_eq!(store.get_camera_mappings().unwrap().len(), 1);
+    assert_eq!(
+        store.get_setting("square.access_token").unwrap().as_deref(),
+        Some("test-new-access")
+    );
+    assert_eq!(
+        store
+            .get_setting("square.webhook_signature_key")
+            .unwrap()
+            .as_deref(),
+        Some("test-old-key")
+    );
+    assert!(!store.consume_oauth_state("test-state").unwrap());
+}
+
+#[test]
 fn startup_removes_interrupted_thumbnail_writes_and_hardens_existing_files() {
     let temp = tempfile::tempdir().unwrap();
     let thumbnails = temp.path().join("thumbnails");

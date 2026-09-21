@@ -252,7 +252,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/settings/square/webhook/register",
             post(square_webhook_registration_disabled),
         )
-        .route("/api/settings/square/oauth-app", put(set_square_oauth_app))
+        .route(
+            "/api/settings/square/oauth-app",
+            get(get_square_oauth_app).put(set_square_oauth_app),
+        )
         .route("/oauth/square/start", get(square_oauth_start))
         .route("/oauth/square/callback", get(square_oauth_callback))
         .route(
@@ -1246,6 +1249,61 @@ async fn square_webhook_registration_disabled(
     ))
 }
 
+async fn get_square_oauth_app(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Response> {
+    require_admin(&state, &headers)?;
+    let _provider_guard = state.store.integration_guard(false)?;
+    Ok(json_response(square_oauth_app_value(&state)?))
+}
+
+fn square_oauth_app_value(state: &AppState) -> AppResult<Value> {
+    let snapshot = state.store.square_oauth_snapshot()?;
+    let present = |value: &Option<String>| value.as_ref().is_some_and(|s| !s.is_empty());
+    let configured = present(&snapshot.client_id) && present(&snapshot.client_secret);
+    let active = present(&snapshot.access_token);
+    let pending_access = state
+        .store
+        .get_setting("square.oauth_pending_access_token")?
+        .unwrap_or_default();
+    let pending_merchant = state
+        .store
+        .get_setting("square.oauth_pending_merchant_id")?
+        .unwrap_or_default();
+    let pending_created = state
+        .store
+        .get_setting("square.oauth_pending_created_at_ms")?
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    let pending_environment = if current_square_oauth_switch(
+        &pending_access,
+        &pending_merchant,
+        pending_created,
+        now_millis(),
+    ) {
+        state
+            .store
+            .get_setting("square.oauth_pending_environment")?
+    } else {
+        None
+    };
+    // Return only the application ID and credential-presence flags. Secrets,
+    // tokens, merchant identity, and OAuth state never leave this endpoint.
+    Ok(json!({
+        "configured": configured,
+        "client_id": snapshot.client_id.unwrap_or_default(),
+        "secret_saved": present(&snapshot.client_secret),
+        "environment": state.store.get_setting("square.oauth_environment")?
+            .unwrap_or_else(|| "production".into()),
+        "active_environment": if active { snapshot.environment } else { None },
+        "active_authentication": if !active { None }
+            else if present(&snapshot.refresh_token) { Some("oauth") }
+            else { Some("access_token") },
+        "pending_environment": pending_environment,
+    }))
+}
+
 async fn set_square_oauth_app(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1254,13 +1312,43 @@ async fn set_square_oauth_app(
     require_admin(&state, &headers)?;
     let _provider_guard = state.store.integration_guard(true)?;
     let client_id = body.client_id.trim();
-    let client_secret = body.client_secret.trim();
-    if !(8..=128).contains(&client_id.len()) || !(8..=256).contains(&client_secret.len()) {
+    let submitted_secret = body.client_secret.trim();
+    if !(8..=128).contains(&client_id.len()) {
         return Err(AppError::Unprocessable(
-            "Invalid Square OAuth application credentials".into(),
+            "Enter a valid Square application ID".into(),
         ));
     }
     crate::clients::square_base_url(&body.environment)?;
+    let saved_secret;
+    let client_secret = if submitted_secret.is_empty() {
+        let same_application = state
+            .store
+            .get_setting("square.oauth_client_id")?
+            .as_deref()
+            == Some(client_id)
+            && state
+                .store
+                .get_setting("square.oauth_environment")?
+                .as_deref()
+                == Some(body.environment.as_str());
+        saved_secret = state
+            .store
+            .get_setting("square.oauth_client_secret")?
+            .unwrap_or_default();
+        if !same_application || saved_secret.is_empty() {
+            return Err(AppError::Unprocessable(
+                "Enter the application secret for this application and environment".into(),
+            ));
+        }
+        saved_secret.as_str()
+    } else {
+        submitted_secret
+    };
+    if !(8..=256).contains(&client_secret.len()) {
+        return Err(AppError::Unprocessable(
+            "Enter a valid Square application secret".into(),
+        ));
+    }
     state.store.update_settings(
         &[
             ("square.oauth_client_id", client_id, false),
@@ -1269,7 +1357,7 @@ async fn set_square_oauth_app(
         ],
         &[],
     )?;
-    Ok(json_response(json!({"ok": true})))
+    Ok(json_response(square_oauth_app_value(&state)?))
 }
 
 async fn square_oauth_start(
@@ -1400,11 +1488,7 @@ async fn confirm_oauth_switch(
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(0);
     let now = now_millis();
-    if access.is_empty()
-        || merchant.is_empty()
-        || created_at_ms > now + 30_000
-        || now.saturating_sub(created_at_ms) > 600_000
-    {
+    if !current_square_oauth_switch(&access, &merchant, created_at_ms, now) {
         state.store.delete_settings(&oauth_pending_keys())?;
         return Err(AppError::Conflict(
             "The pending Square authorization expired; connect again".into(),
@@ -1429,6 +1513,13 @@ async fn confirm_oauth_switch(
         "account_revision": revision,
         "evidence_cleanup_pending": evidence_cleanup_pending,
     })))
+}
+
+fn current_square_oauth_switch(access: &str, merchant: &str, created: i64, now: i64) -> bool {
+    !access.is_empty()
+        && !merchant.is_empty()
+        && created <= now + 30_000
+        && now.saturating_sub(created) <= 600_000
 }
 
 async fn cancel_oauth_switch(
@@ -2948,6 +3039,195 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn square_oauth_settings_persist_without_exposing_secrets_or_switching_accounts() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, cookie) = authenticated_state(temp.path().to_owned());
+        state
+            .store
+            .update_settings(
+                &[
+                    ("square.access_token", "test-sandbox-access", true),
+                    ("square.environment", "sandbox", false),
+                ],
+                &[],
+            )
+            .unwrap();
+        let app = build_router(state.clone());
+        let response = app.clone().oneshot(http_request("PUT", "/api/settings/square/oauth-app",
+            json!({"client_id":"test-production-app", "client_secret":"test-production-secret", "environment":"production"}),
+            Some(&cookie))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let expected = json!({
+            "configured": true, "client_id": "test-production-app", "secret_saved": true,
+            "environment": "production", "active_environment": "sandbox",
+            "active_authentication": "access_token", "pending_environment": null,
+        });
+        assert_eq!(response_json_value(response).await, expected);
+
+        // A fresh process can restore the form without reading secrets into the browser.
+        let reloaded = build_router(test_state(temp.path().to_owned()));
+        let response = reloaded
+            .oneshot(http_request(
+                "GET",
+                "/api/settings/square/oauth-app",
+                json!({}),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+        assert_eq!(response_json_value(response).await, expected);
+
+        // Leaving the secret blank preserves it only for the same application/environment.
+        for (client_id, environment, expected_status) in [
+            ("test-production-app", "production", StatusCode::OK),
+            (
+                "test-different-app",
+                "production",
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                "test-production-app",
+                "sandbox",
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(http_request(
+                    "PUT",
+                    "/api/settings/square/oauth-app",
+                    json!({"client_id":client_id, "client_secret":"", "environment":environment}),
+                    Some(&cookie),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected_status);
+        }
+        assert_eq!(
+            state
+                .store
+                .get_setting("square.oauth_client_secret")
+                .unwrap()
+                .as_deref(),
+            Some("test-production-secret")
+        );
+        assert_eq!(
+            state
+                .store
+                .get_setting("square.oauth_client_id")
+                .unwrap()
+                .as_deref(),
+            Some("test-production-app")
+        );
+        assert_eq!(
+            state
+                .store
+                .get_setting("square.oauth_environment")
+                .unwrap()
+                .as_deref(),
+            Some("production")
+        );
+        assert_eq!(
+            state
+                .store
+                .get_setting("square.access_token")
+                .unwrap()
+                .as_deref(),
+            Some("test-sandbox-access")
+        );
+        assert_eq!(
+            state
+                .store
+                .get_setting("square.environment")
+                .unwrap()
+                .as_deref(),
+            Some("sandbox")
+        );
+    }
+
+    #[tokio::test]
+    async fn square_oauth_settings_show_only_current_switches_and_require_initial_secret() {
+        let temp = tempfile::tempdir().unwrap();
+        let (state, cookie) = authenticated_state(temp.path().to_owned());
+        let app = build_router(state.clone());
+        let response = app.clone().oneshot(http_request("PUT", "/api/settings/square/oauth-app",
+            json!({"client_id":"test-production-app", "client_secret":"", "environment":"production"}),
+            Some(&cookie))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            !square_oauth_app_value(&state).unwrap()["configured"]
+                .as_bool()
+                .unwrap()
+        );
+        state
+            .store
+            .update_settings(
+                &[
+                    (
+                        "square.oauth_pending_access_token",
+                        "test-pending-access",
+                        true,
+                    ),
+                    (
+                        "square.oauth_pending_refresh_token",
+                        "test-pending-refresh",
+                        true,
+                    ),
+                    (
+                        "square.oauth_pending_merchant_id",
+                        "TEST_PENDING_MERCHANT",
+                        false,
+                    ),
+                    ("square.oauth_pending_environment", "production", false),
+                ],
+                &[],
+            )
+            .unwrap();
+        for (age, pending) in [
+            (0, json!("production")),
+            (601_000, Value::Null),
+            (-60_000, Value::Null),
+        ] {
+            state
+                .store
+                .set_setting(
+                    "square.oauth_pending_created_at_ms",
+                    &(now_millis() - age).to_string(),
+                    false,
+                )
+                .unwrap();
+            let response = app
+                .clone()
+                .oneshot(http_request(
+                    "GET",
+                    "/api/settings/square/oauth-app",
+                    json!({}),
+                    Some(&cookie),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response_json_value(response).await;
+            assert_eq!(body["pending_environment"], pending);
+            assert_eq!(body["active_environment"], Value::Null);
+            assert!(!body.to_string().contains("test-pending"));
+            assert!(!body.to_string().contains("TEST_PENDING_MERCHANT"));
+        }
+        assert_eq!(
+            state
+                .store
+                .get_setting("square.oauth_pending_access_token")
+                .unwrap()
+                .as_deref(),
+            Some("test-pending-access")
+        );
+    }
+
+    #[tokio::test]
     async fn square_webhook_registration_is_forbidden_even_for_admins() {
         for environment in ["production", "sandbox"] {
             let temp = tempfile::tempdir().unwrap();
@@ -3095,6 +3375,18 @@ mod tests {
             .unwrap();
         assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
 
+        let forbidden = app
+            .clone()
+            .oneshot(http_request(
+                "GET",
+                "/api/settings/square/oauth-app",
+                json!({}),
+                Some(&viewer_cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
         let readable = app
             .oneshot(http_request(
                 "GET",
@@ -3126,6 +3418,7 @@ mod tests {
             ("GET", "/api/settings/thumbnail-storage"),
             ("POST", "/api/settings/thumbnail-storage/maintenance"),
             ("GET", "/oauth/square/start"),
+            ("GET", "/api/settings/square/oauth-app"),
             ("DELETE", "/api/settings/square/oauth-switch"),
             ("GET", "/api/health/protect"),
             ("GET", "/api/cameras"),

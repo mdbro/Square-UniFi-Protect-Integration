@@ -220,24 +220,38 @@
       <p class="hint"><strong>Read-only Square access:</strong> this app reads
         merchant details, locations, and payments. It cannot create or change
         Square payments, refunds, or webhook subscriptions.</p>
-      <p class="hint"><strong>Option A — Connect with Square (recommended):</strong>
-        create one Square application (developer dashboard → Credentials), set its
-        OAuth Redirect URL to <code>https://&lt;this-host&gt;/oauth/square/callback</code>,
-        save its OAuth Application ID and Secret below once, then sign in through
-        Square. Only merchant and payment read permissions are requested.
-        Tokens are stored encrypted and refreshed automatically.</p>
-      <form id="square-oauth-form">
-        <label>Application ID <input id="square-oauth-client-id" autocomplete="off"></label>
-        <label>Application Secret <input type="password" id="square-oauth-secret" autocomplete="off"></label>
-        <label>Environment
-          <select id="square-oauth-env">
-            <option value="production">Production</option>
-            <option value="sandbox">Sandbox</option>
-          </select>
-        </label>
-        <button type="submit">Save application</button>
-        <button type="button" id="square-oauth-connect">Connect with Square</button>
-      </form>
+      <div class="square-connection-summary" id="square-connection-summary" role="status" tabindex="-1">
+        <strong id="square-active-connection">Checking saved Square connection…</strong>
+        <p id="square-active-detail"></p>
+      </div>
+      <h3>Option A — Sign in with Square (recommended)</h3>
+      <p class="hint">Complete both steps below. Square sign-in requests only
+        merchant and payment read permissions and renews access automatically.</p>
+      <div class="square-oauth-step">
+        <h4>1. Save application credentials</h4>
+        <p class="hint">In the Square Developer Console, open your application
+          and set its OAuth Redirect URL to <code id="square-oauth-redirect-url"></code>.</p>
+        <p id="square-oauth-saved-status" class="hint" role="status">Loading saved application details…</p>
+        <form id="square-oauth-form">
+          <label>Application ID <input id="square-oauth-client-id" autocomplete="off" minlength="8" maxlength="128" required></label>
+          <label>Application secret <input type="password" id="square-oauth-secret" autocomplete="new-password" minlength="8" maxlength="256" aria-describedby="square-oauth-secret-hint" required></label>
+          <p id="square-oauth-secret-hint" class="hint">Enter the application secret from Square.</p>
+          <label>Application environment
+            <select id="square-oauth-env">
+              <option value="production">Production — live transactions</option>
+              <option value="sandbox">Sandbox — test transactions</option>
+            </select>
+          </label>
+          <button type="submit" id="square-oauth-save" disabled>Save credentials</button>
+          <p id="square-oauth-save-result" class="square-oauth-feedback" role="status"></p>
+        </form>
+      </div>
+      <div class="square-oauth-step">
+        <h4>2. Authorize Square access</h4>
+        <p id="square-oauth-next-step" role="status">Loading connection status…</p>
+        <p id="square-oauth-signin-result" class="square-oauth-feedback" role="status"></p>
+        <button type="button" id="square-oauth-connect" disabled>Connect with Square</button>
+      </div>
       <div id="square-oauth-switch-warning" class="destructive-warning" role="alert" hidden>
         <strong>Different Square account or environment authorized.</strong>
         <p>Confirming permanently erases the previous account's local transactions, thumbnails, observed POS devices, camera mappings, sync history, and saved Square webhook credentials.</p>
@@ -251,7 +265,7 @@
         Square writes.</p>
       <form id="square-form">
         <label>Access token <input type="password" id="square-token" autocomplete="off" required></label>
-        <label>Environment
+        <label>Access token environment
           <select id="square-env">
             <option value="production">Production</option>
             <option value="sandbox">Sandbox</option>

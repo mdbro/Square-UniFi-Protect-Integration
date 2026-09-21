@@ -165,10 +165,17 @@ Then:
    seen on a successful reconnect; every later mismatch requires a confirmed reset.
    If a Protect version never reports an NVR id or MAC, the saved host string is
    the only available identity boundary.
-3. **Settings → Square account** — use **Connect with Square** for an OAuth
-   connection requesting only `MERCHANT_PROFILE_READ` and `PAYMENTS_READ`, or
-   paste an access token manually. A personal access token has broader
-   permissions in Square, but the app still enforces read-only requests.
+3. **Settings → Square account** — under **Option A**, first **Save credentials**,
+   then use **Connect with Production Square** (or Sandbox) to sign in and
+   authorize the account. Saving application credentials alone does not switch
+   the active connection. The page displays the active environment separately
+   from the saved application environment, restores the saved application ID,
+   and shows whether a secret is already stored. Leaving the secret blank keeps
+   it only when the application ID and environment are unchanged.
+   The OAuth connection requests only `MERCHANT_PROFILE_READ` and `PAYMENTS_READ`.
+   Alternatively, use **Option B** to paste an access token manually. A personal
+   access token has broader permissions in Square, but the app still enforces
+   read-only requests.
    Optionally configure a webhook in the Square Developer Console, then save
    its signature key and notification URL locally for real-time ingestion.
    Subscribe to both `payment.created` and `payment.updated`, pointing at

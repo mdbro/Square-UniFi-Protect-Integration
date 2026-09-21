@@ -24,6 +24,11 @@ let wizardProtectConsoleGeneration = "";
 let currentUser = null;
 let motionSettingsCameras = [];
 let motionAlertLoadGeneration = 0;
+let squareOAuthSettings = null;
+let squareOAuthLoadGeneration = 0;
+let squareOAuthDirty = false;
+let squareOAuthBusy = false;
+let squareOAuthReturnFeedback = null;
 
 function setCurrentUser(payload) {
   currentUser = sessionUser(payload);
@@ -108,15 +113,9 @@ function showBootFailure(error) {
 async function boot() {
   const oauthOutcome = new URLSearchParams(window.location.search).get("square_oauth");
   const oauthFeedback = squareOAuthResultFeedback(window.location.search);
+  squareOAuthReturnFeedback = oauthFeedback;
   if (oauthFeedback) {
     message(oauthFeedback.text, oauthFeedback.kind);
-    window.history.replaceState({}, "", "/");
-  } else if (oauthOutcome === "switch_required") {
-    $("#square-oauth-switch-warning").hidden = false;
-    message(
-      "A different Square account authorized. Open Settings to confirm or cancel the switch.",
-      "error",
-    );
     window.history.replaceState({}, "", "/");
   }
   let status;
@@ -135,6 +134,10 @@ async function boot() {
     const session = await api("/api/session");
     if (!setCurrentUser(session)) throw new Error("Invalid session response");
     await enterAppOrWizard();
+    if (isAdmin(currentUser) && oauthOutcome && oauthFeedback) {
+      show("#view-settings");
+      $("#square-connection-summary").focus();
+    }
   } catch (err) {
     if (isSessionExpiredError(err)) return;
     showBootFailure(err);
@@ -859,10 +862,103 @@ $("#thumbnail-optimize-existing").addEventListener("click", async () => {
   }
 });
 
+function squareOAuthMessage(text, kind = "") {
+  const el = $("#square-oauth-save-result");
+  el.textContent = text;
+  el.className = `square-oauth-feedback ${kind}`;
+}
+
+function squareOAuthSignInMessage(text, kind = "") {
+  const el = $("#square-oauth-signin-result");
+  el.textContent = text;
+  el.className = `square-oauth-feedback ${kind}`;
+}
+
+function updateSquareOAuthControls() {
+  if (!squareOAuthSettings) return;
+  const view = squareOAuthView(squareOAuthSettings, squareOAuthDirty);
+  $("#square-oauth-next-step").textContent = view.nextStep;
+  const connect = $("#square-oauth-connect");
+  connect.textContent = view.connectLabel;
+  connect.disabled = squareOAuthBusy || !view.canConnect;
+  $("#square-oauth-save").disabled = squareOAuthBusy;
+  $("#square-oauth-save").textContent = squareOAuthBusy ? "Saving…" : "Save credentials";
+  const keepSecret = squareOAuthCanKeepSecret(
+    squareOAuthSettings, $("#square-oauth-client-id").value, $("#square-oauth-env").value,
+  );
+  $("#square-oauth-secret").required = !keepSecret;
+  $("#square-oauth-secret").placeholder = keepSecret ? "Saved — leave blank to keep" : "Enter application secret";
+  $("#square-oauth-secret-hint").textContent = keepSecret
+    ? "A secret is already saved for this application. Leave blank to keep it, or enter a replacement."
+    : "Enter the secret for this application and environment from Square.";
+  for (const id of ["#square-oauth-client-id", "#square-oauth-secret", "#square-oauth-env"]) {
+    $(id).disabled = squareOAuthBusy;
+  }
+}
+
+function renderSquareOAuthSettings(settings) {
+  if (!squareOAuthSettings) squareOAuthMessage("");
+  squareOAuthSettings = settings;
+  const view = squareOAuthView(settings, squareOAuthDirty);
+  $("#square-active-connection").textContent = view.activeTitle;
+  $("#square-active-detail").textContent = view.activeDetail;
+  $("#square-oauth-saved-status").textContent = view.savedStatus;
+  $("#square-oauth-redirect-url").textContent = `${window.location.origin}/oauth/square/callback`;
+  $("#square-oauth-switch-warning").hidden = !settings.pending_environment;
+  if (!squareOAuthDirty) {
+    $("#square-oauth-client-id").value = settings.client_id;
+    $("#square-oauth-env").value = settings.environment;
+  }
+  updateSquareOAuthControls();
+  if (squareOAuthReturnFeedback) {
+    squareOAuthSignInMessage(squareOAuthReturnFeedback.text, squareOAuthReturnFeedback.kind);
+  }
+}
+
+async function loadSquareOAuthSettings() {
+  if (squareOAuthBusy) return;
+  const generation = ++squareOAuthLoadGeneration;
+  try {
+    const settings = await api("/api/settings/square/oauth-app");
+    if (generation === squareOAuthLoadGeneration) renderSquareOAuthSettings(settings);
+  } catch (err) {
+    if (generation !== squareOAuthLoadGeneration) return;
+    squareOAuthSettings = null;
+    $("#square-active-connection").textContent = "Square connection status unavailable";
+    $("#square-active-detail").textContent = "Reopen Settings to try loading the saved configuration again.";
+    $("#square-oauth-saved-status").textContent = "Could not load saved application details.";
+    $("#square-oauth-next-step").textContent = "Reload the saved configuration before signing in.";
+    $("#square-oauth-connect").disabled = true;
+    $("#square-oauth-save").disabled = true;
+    squareOAuthMessage(err.message, "error");
+  }
+}
+
+for (const id of ["#square-oauth-client-id", "#square-oauth-secret", "#square-oauth-env"]) {
+  $(id).addEventListener("input", () => {
+    squareOAuthDirty = !squareOAuthSettings
+      || $("#square-oauth-client-id").value.trim() !== squareOAuthSettings.client_id
+      || $("#square-oauth-env").value !== squareOAuthSettings.environment
+      || $("#square-oauth-secret").value.length > 0;
+    squareOAuthReturnFeedback = null;
+    squareOAuthMessage("");
+    squareOAuthSignInMessage("");
+    updateSquareOAuthControls();
+  });
+}
+
 $("#square-oauth-form").addEventListener("submit", async (e) => {
   e.preventDefault();
+  if (squareOAuthBusy) return;
+  squareOAuthBusy = true;
+  squareOAuthReturnFeedback = null;
+  squareOAuthSignInMessage("");
+  message("", "");
+  ++squareOAuthLoadGeneration; // A slow pre-save read must not restore old details.
+  updateSquareOAuthControls();
+  squareOAuthMessage("Saving application credentials…");
   try {
-    await api("/api/settings/square/oauth-app", {
+    const settings = await api("/api/settings/square/oauth-app", {
       method: "PUT",
       body: JSON.stringify({
         client_id: $("#square-oauth-client-id").value.trim(),
@@ -871,13 +967,24 @@ $("#square-oauth-form").addEventListener("submit", async (e) => {
       }),
     });
     $("#square-oauth-secret").value = "";
-    message("Square application saved. Press 'Connect with Square' to sign in.", "ok");
+    squareOAuthDirty = false;
+    renderSquareOAuthSettings(settings);
+    squareOAuthMessage(
+      `${squareEnvironmentLabel(settings.environment)} application credentials saved. Your active connection is shown above.`,
+      "ok",
+    );
   } catch (err) {
-    message(err.message, "error");
+    squareOAuthMessage(`Credentials were not saved. ${err.message}`, "error");
+  } finally {
+    squareOAuthBusy = false;
+    updateSquareOAuthControls();
   }
 });
 
 $("#square-oauth-connect").addEventListener("click", () => {
+  if (!squareOAuthSettings || squareOAuthBusy || !squareOAuthView(squareOAuthSettings, squareOAuthDirty).canConnect) return;
+  $("#square-oauth-connect").disabled = true;
+  $("#square-oauth-next-step").textContent = "Opening Square sign-in. Return here after approving read-only access to finish connecting.";
   window.location.href = "/oauth/square/start";
 });
 
@@ -886,6 +993,8 @@ $("#square-oauth-switch-confirm").addEventListener("click", async () => {
     const result = await api("/api/settings/square/oauth-switch/confirm", {
       method: "POST",
     });
+    squareOAuthReturnFeedback = null;
+    squareOAuthSignInMessage("Square account switch completed. Map this account's cameras below.", "ok");
     $("#square-oauth-switch-warning").hidden = true;
     squareAccountRevision = result.account_revision || "";
     lastTransactionPayload = null;
@@ -899,6 +1008,9 @@ $("#square-oauth-switch-confirm").addEventListener("click", async () => {
       "ok",
     );
   } catch (err) {
+    squareOAuthReturnFeedback = null;
+    squareOAuthSignInMessage(err.message, "error");
+    void loadSquareOAuthSettings();
     message(err.message, "error");
   }
 });
@@ -906,9 +1018,13 @@ $("#square-oauth-switch-confirm").addEventListener("click", async () => {
 $("#square-oauth-switch-cancel").addEventListener("click", async () => {
   try {
     await api("/api/settings/square/oauth-switch", { method: "DELETE" });
+    squareOAuthReturnFeedback = null;
     $("#square-oauth-switch-warning").hidden = true;
+    squareOAuthSignInMessage("Kept the current Square connection. Saved application credentials are still available.");
+    void loadSquareOAuthSettings();
     message("Kept the current Square account.", "");
   } catch (err) {
+    squareOAuthSignInMessage(err.message, "error");
     message(err.message, "error");
   }
 });
@@ -1016,6 +1132,7 @@ const refreshSquareStatus = createConnectionStatusRefresher(
 );
 
 async function fetchSettingsView() {
+  void loadSquareOAuthSettings();
   // Clear any previous console's rows/preview before the provider reads so a
   // switch never leaves stale evidence on screen while data loads.
   clearProtectConsoleView(

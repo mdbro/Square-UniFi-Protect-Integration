@@ -372,6 +372,61 @@ return {
 }
 
 #[test]
+fn square_oauth_form_distinguishes_saved_credentials_from_the_active_connection() {
+    let result = node_eval(
+        "square-form.js",
+        r#"
+const saved={configured:true,client_id:"test-production-app",secret_saved:true,environment:"production",active_environment:"sandbox",active_authentication:"access_token",pending_environment:null};
+return {
+  saved:m.squareOAuthView(saved),
+  dirty:m.squareOAuthView(saved,true),
+  empty:m.squareOAuthView({...saved,configured:false,active_environment:null}),
+  connected:m.squareOAuthView({...saved,active_environment:"production",active_authentication:"oauth"}),
+  pending:m.squareOAuthView({...saved,pending_environment:"production"}),
+  keepSecret:[m.squareOAuthCanKeepSecret(saved,"test-production-app","production"),m.squareOAuthCanKeepSecret(saved,"test-other-app","production"),m.squareOAuthCanKeepSecret(saved,"test-production-app","sandbox")],
+  expired:m.squareOAuthResultFeedback("?square_oauth=invalid_state"),
+};"#,
+    );
+    assert_eq!(result["saved"]["activeTitle"], "Active connection: Sandbox");
+    assert!(
+        result["saved"]["nextStep"]
+            .as_str()
+            .unwrap()
+            .contains("Production application credentials are saved")
+    );
+    assert_eq!(result["saved"]["canConnect"], true);
+    assert_eq!(result["dirty"]["canConnect"], false);
+    assert_eq!(result["empty"]["canConnect"], false);
+    assert_eq!(
+        result["empty"]["activeTitle"],
+        "No active Square connection"
+    );
+    assert_eq!(
+        result["connected"]["activeTitle"],
+        "Active connection: Production"
+    );
+    assert_eq!(
+        result["connected"]["connectLabel"],
+        "Reconnect Production Square"
+    );
+    assert_eq!(result["pending"]["canConnect"], false);
+    assert!(
+        result["pending"]["nextStep"]
+            .as_str()
+            .unwrap()
+            .contains("confirmation")
+    );
+    assert_eq!(result["keepSecret"], json!([true, false, false]));
+    assert_eq!(result["expired"]["kind"], "error");
+    assert!(
+        result["expired"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("existing connection is unchanged")
+    );
+}
+
+#[test]
 fn square_form_and_transaction_filters_clear_secrets_and_keep_queries_in_json() {
     let square = node_eval(
         "square-form.js",

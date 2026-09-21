@@ -40,6 +40,25 @@ button[type="submit"], #save-mapping, #sync-now, #export-csv {
 #export-csv { text-decoration: none; }
 #export-csv:focus-visible { outline: 3px solid #2684ff; outline-offset: 3px; }
 .hint { opacity: 0.7; font-size: 0.85rem; }
+.square-connection-summary, .square-oauth-step {
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 1rem; margin: 0.75rem 0; overflow-wrap: anywhere;
+}
+.square-connection-summary { border-left: 4px solid var(--accent); }
+.square-connection-summary p { margin: 0.25rem 0 0; }
+.square-oauth-step h4 { margin: 0 0 0.5rem; }
+.square-oauth-step form { margin-bottom: 0; }
+.square-oauth-step form .hint { margin: 0; }
+.square-oauth-step code { user-select: all; }
+#square-oauth-connect {
+  padding: 0.6rem 1rem; border: none; border-radius: 6px;
+  background: var(--accent); color: #fff; font: inherit; cursor: pointer;
+}
+.square-oauth-step button:disabled { opacity: 0.5; cursor: not-allowed; }
+.square-oauth-feedback { margin: 0; font-size: 0.9rem; }
+#square-oauth-signin-result:not(:empty) { margin-bottom: 0.75rem; }
+.square-oauth-feedback.error { color: #c22; }
+.square-oauth-feedback.ok { color: #187a28; }
 .destructive-warning {
   padding: 0.75rem; border: 1px solid #c33; border-radius: 6px;
   background: color-mix(in srgb, #c33 10%, transparent); font-size: 0.9rem;
@@ -51,6 +70,8 @@ button[type="submit"], #save-mapping, #sync-now, #export-csv {
 
 @media (prefers-color-scheme: dark) {
   #message.ok { color: #4ec760; }
+  .square-oauth-feedback.ok { color: #4ec760; }
+  .square-oauth-feedback.error { color: #ff8585; }
 }
 
 .transaction-filters {

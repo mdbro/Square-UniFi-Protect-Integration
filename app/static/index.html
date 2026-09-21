@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Square × UniFi Protect</title>
-  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/style.css?v=2">
 </head>
 <body>
   <header>
@@ -18,6 +18,13 @@
   </header>
 
   <main>
+    <section id="view-loading" aria-live="polite">
+      <h2 id="startup-title">Loading application…</h2>
+      <p id="startup-detail">If this message remains, reload to fetch the latest application files.</p>
+      <a id="startup-reload" href="/?reload=1">Reload application</a>
+      <noscript><p>JavaScript must be enabled to use this application.</p></noscript>
+    </section>
+
     <!-- Startup error recovery -->
     <section id="view-boot-error" hidden>
       <h2>Could not load the application</h2>
@@ -377,23 +384,26 @@
     <p id="message" role="status"></p>
   </main>
 
-  <script src="/bootstrap-form.js"></script>
-  <script src="/boot-recovery.js"></script>
-  <script src="/protect-console-switch.js"></script>
-  <script src="/format.js"></script>
-  <script src="/square-form.js"></script>
-  <script src="/deep-link-form.js"></script>
-  <script src="/protect-alarm.js"></script>
-  <script src="/protect-motion.js"></script>
-  <script src="/view-focus.js"></script>
-  <script src="/settings-loader.js"></script>
-  <script src="/nav-view.js"></script>
-  <script src="/transaction-filters.js"></script>
-  <script src="/transaction-note.js"></script>
-  <script src="/webhook-delivery.js"></script>
-  <script src="/roles.js"></script>
-  <script src="/user-management.js"></script>
-  <script src="/login-audit.js"></script>
-  <script src="/app.js"></script>
+  <!-- The query key bypasses legacy unversioned caches. The server now requires
+       revalidation on every load, including for these versioned asset URLs. -->
+  <script src="/startup.js?v=2"></script>
+  <script src="/bootstrap-form.js?v=2"></script>
+  <script src="/boot-recovery.js?v=2"></script>
+  <script src="/protect-console-switch.js?v=2"></script>
+  <script src="/format.js?v=2"></script>
+  <script src="/square-form.js?v=2"></script>
+  <script src="/deep-link-form.js?v=2"></script>
+  <script src="/protect-alarm.js?v=2"></script>
+  <script src="/protect-motion.js?v=2"></script>
+  <script src="/view-focus.js?v=2"></script>
+  <script src="/settings-loader.js?v=2"></script>
+  <script src="/nav-view.js?v=2"></script>
+  <script src="/transaction-filters.js?v=2"></script>
+  <script src="/transaction-note.js?v=2"></script>
+  <script src="/webhook-delivery.js?v=2"></script>
+  <script src="/roles.js?v=2"></script>
+  <script src="/user-management.js?v=2"></script>
+  <script src="/login-audit.js?v=2"></script>
+  <script src="/app.js?v=2"></script>
 </body>
 </html>

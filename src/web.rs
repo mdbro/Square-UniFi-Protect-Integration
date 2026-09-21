@@ -322,10 +322,17 @@ async fn security_headers(request: Request, next: Next) -> Response {
             HeaderValue::from_static(value),
         );
     }
-    if api_request && !response.headers().contains_key(header::CACHE_CONTROL) {
+    if !response.headers().contains_key(header::CACHE_CONTROL) {
         response.headers_mut().insert(
             header::CACHE_CONTROL,
-            HeaderValue::from_static("private, no-store"),
+            HeaderValue::from_static(if api_request {
+                "private, no-store"
+            } else {
+                // HTML and scripts must revalidate together after an upgrade.
+                // Heuristic caching can otherwise run an old script against a
+                // new page and crash before any application view is visible.
+                "no-cache"
+            }),
         );
     }
     response
@@ -3448,6 +3455,35 @@ mod tests {
             assert_eq!(
                 response.headers()[header::CACHE_CONTROL],
                 "private, no-store"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_assets_revalidate_on_normal_and_conditional_requests() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = build_router(test_state(temp.path().to_owned()));
+        for path in ["/", "/app.js?v=2", "/startup.js?v=2", "/style.css?v=2"] {
+            let response = app
+                .clone()
+                .oneshot(http_request("GET", path, json!({}), None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "no-cache",
+                "{path}"
+            );
+            let etag = response.headers()[header::ETAG].clone();
+            let mut request = http_request("GET", path, json!({}), None);
+            request.headers_mut().insert(header::IF_NONE_MATCH, etag);
+            let cached = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(cached.status(), StatusCode::NOT_MODIFIED, "{path}");
+            assert_eq!(
+                cached.headers()[header::CACHE_CONTROL],
+                "no-cache",
+                "{path}"
             );
         }
     }

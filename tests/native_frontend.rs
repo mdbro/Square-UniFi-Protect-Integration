@@ -545,9 +545,69 @@ fn webhook_delivery_copy_handles_milliseconds_seconds_minutes_and_clock_skew() {
 }
 
 #[test]
+fn startup_recovery_survives_missing_scripts_and_stale_entrypoint_errors() {
+    let script = serde_json::to_string(&source("app/static/startup.js")).unwrap();
+    let program = format!(
+        r#"
+const assert=require('node:assert/strict'), vm=require('node:vm');
+function createPage() {{
+  const elements={{
+    'view-loading':{{hidden:false}}, 'startup-title':{{textContent:'Loading application…'}},
+    'startup-detail':{{textContent:''}}, 'startup-reload':{{addEventListener(){{}}}},
+  }};
+  const listeners={{}};
+  let timer, timerCleared=false;
+  class ErrorEvent {{}}
+  class HTMLScriptElement {{}}
+  const context=vm.createContext({{
+    document:{{getElementById:id=>elements[id] || null}}, ErrorEvent, HTMLScriptElement,
+    window:{{
+      addEventListener:(name,handler)=>{{listeners[name]=handler;}},
+      setTimeout:handler=>{{timer=handler;return 1;}},
+      clearTimeout:()=>{{timerCleared=true;}},
+    }},
+  }});
+  vm.runInContext({script},context);
+  return {{elements,listeners,context,ErrorEvent,HTMLScriptElement,
+    expire:()=>timer(),timerCleared:()=>timerCleared}};
+}}
+const stale=createPage();
+// An older cached app tries to bind a button removed from the current HTML.
+assert.throws(()=>vm.runInContext('document.getElementById("removed-button").addEventListener("click",()=>{{}})',stale.context));
+stale.listeners.error(new stale.ErrorEvent());
+assert.equal(stale.elements['view-loading'].hidden,false);
+assert.match(stale.elements['startup-title'].textContent,/Could not finish loading/);
+assert.match(stale.elements['startup-detail'].textContent,/Reload/);
+const missing=createPage();
+missing.listeners.error({{target:new missing.HTMLScriptElement()}});
+assert.match(missing.elements['startup-title'].textContent,/Could not finish loading/);
+const slow=createPage();slow.expire();
+assert.match(slow.elements['startup-title'].textContent,/Could not finish loading/);
+const ready=createPage();ready.listeners['squareprotect:ready']();
+assert.equal(ready.elements['view-loading'].hidden,true);
+assert.equal(ready.timerCleared(),true);
+ready.listeners.unhandledrejection();
+assert.equal(ready.elements['view-loading'].hidden,true);
+process.stdout.write('Startup recovery scenarios passed.');
+"#
+    );
+    let output = Command::new("node")
+        .arg("-e")
+        .arg(program)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn helper_scripts_load_before_the_application_entrypoint() {
     let html = source("app/static/index.html");
     for helper in [
+        "/startup.js",
         "/bootstrap-form.js",
         "/boot-recovery.js",
         "/protect-console-switch.js",

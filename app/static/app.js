@@ -56,6 +56,7 @@ function show(viewId, focusHeading = true) {
     document.querySelectorAll("nav button[data-view]"),
   );
   if (focusHeading) focusViewHeading(view);
+  window.dispatchEvent(new Event("squareprotect:ready"));
 }
 
 function message(text, kind) {

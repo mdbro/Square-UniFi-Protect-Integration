@@ -217,11 +217,15 @@
           <span class="conn-dot"></span><span class="conn-text"></span>
         </span>
       </h2>
+      <p class="hint"><strong>Read-only Square access:</strong> this app reads
+        merchant details, locations, and payments. It cannot create or change
+        Square payments, refunds, or webhook subscriptions.</p>
       <p class="hint"><strong>Option A — Connect with Square (recommended):</strong>
         create one Square application (developer dashboard → Credentials), set its
         OAuth Redirect URL to <code>https://&lt;this-host&gt;/oauth/square/callback</code>,
         save its OAuth Application ID and Secret below once, then sign in through
-        Square. Tokens are stored encrypted and refreshed automatically.</p>
+        Square. Only merchant and payment read permissions are requested.
+        Tokens are stored encrypted and refreshed automatically.</p>
       <form id="square-oauth-form">
         <label>Application ID <input id="square-oauth-client-id" autocomplete="off"></label>
         <label>Application Secret <input type="password" id="square-oauth-secret" autocomplete="off"></label>
@@ -241,6 +245,10 @@
         <button type="button" id="square-oauth-switch-cancel">Keep current account</button>
       </div>
       <p class="hint"><strong>Option B — paste an access token manually:</strong></p>
+      <p class="hint">Use a token with only <code>MERCHANT_PROFILE_READ</code>
+        and <code>PAYMENTS_READ</code> to restrict access in Square too.
+        Personal access tokens have broader permissions; the app still blocks
+        Square writes.</p>
       <form id="square-form">
         <label>Access token <input type="password" id="square-token" autocomplete="off" required></label>
         <label>Environment
@@ -251,11 +259,10 @@
         </label>
         <label>Webhook signature key (optional) <input type="password" id="square-webhook-key" autocomplete="off"></label>
         <label>Webhook notification URL (optional) <input id="square-webhook-url" placeholder="https://example.com/webhooks/square"></label>
-        <button type="button" id="square-register-webhook">Register webhook automatically</button>
-        <p class="hint">Automatic registration needs a token allowed to manage webhook subscriptions (usually the application's personal access token from the Square developer dashboard).</p>
-        <p class="hint">Enter the public notification URL above, press this button,
-          and the subscription and signature key are set up for you — no
-          developer-dashboard steps needed.</p>
+        <p class="hint">For instant updates, configure <code>payment.created</code>
+          and <code>payment.updated</code> in the Square Developer Console, then
+          paste the signature key and notification URL here. These settings
+          are saved locally. Polling also works without a webhook.</p>
         <label class="check"><input type="checkbox" id="square-clear-webhook"> Remove saved webhook configuration</label>
         <p class="hint">Leaving the webhook fields blank keeps any saved webhook configuration.</p>
         <div id="square-account-switch-warning" class="destructive-warning" role="alert" hidden>

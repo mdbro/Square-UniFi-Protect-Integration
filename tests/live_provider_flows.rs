@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     env,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
@@ -11,17 +10,14 @@ use axum::{
     http::{Request, StatusCode, header},
 };
 use chrono::{SecondsFormat, TimeZone, Utc};
-use reqwest::Client;
 use serde_json::{Value, json};
 use square_unifi_protect::{
     AppState, Config, DEFAULT_PORT, Store, build_router,
-    clients::{ProtectClient, SQUARE_VERSION, SquareClient},
+    clients::{ProtectClient, SquareClient, parse_payment},
     models::{CameraMappingEntry, PaymentFacts},
     store::now_millis,
-    sync::SyncEngine,
 };
 use tower::ServiceExt;
-use uuid::Uuid;
 
 fn required_secret(name: &str) -> String {
     env::var(name).unwrap_or_else(|_| {
@@ -118,86 +114,36 @@ fn payment(id: &str, location_id: &str, timestamp: i64) -> PaymentFacts {
 }
 
 #[tokio::test]
-#[ignore = "creates 10 Square Sandbox payments and requires credentials"]
-async fn square_sandbox_round_trips_ten_transactions() {
+#[ignore = "reads existing Square account data and requires credentials"]
+async fn square_reads_existing_merchant_locations_and_payments() {
     let access_token = required_secret("SPI_TEST_SQUARE_ACCESS_TOKEN");
-    let square = SquareClient::new(&access_token, "sandbox").unwrap();
-    let location = square
+    let environment =
+        env::var("SPI_TEST_SQUARE_ENVIRONMENT").unwrap_or_else(|_| "production".into());
+    let square = SquareClient::new(&access_token, &environment)
+        .expect("Square test settings should be valid");
+    assert!(
+        square.merchant_id().await.is_ok(),
+        "Square merchant read failed"
+    );
+    let locations = square
         .list_locations()
         .await
-        .expect("Square credentials or connection failed")
-        .into_iter()
-        .find(|location| location.get("status").and_then(Value::as_str) == Some("ACTIVE"))
-        .expect("Square Sandbox has no active location");
-    let location_id = location
-        .get("id")
-        .and_then(Value::as_str)
-        .expect("Square location id is missing");
-
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .unwrap();
-    let mut created = Vec::new();
-    for index in 0..10 {
-        let response = client
-            .post("https://connect.squareupsandbox.com/v2/payments")
-            .bearer_auth(&access_token)
-            .header("Square-Version", SQUARE_VERSION)
-            .json(&json!({
-                "source_id": "cnon:card-nonce-ok",
-                "idempotency_key": Uuid::new_v4().to_string(),
-                "amount_money": {"amount": index + 1, "currency": "USD"},
-                "autocomplete": true,
-                "location_id": location_id,
-                "note": "Square Protect opt-in live test",
-                "reference_id": format!("spi-{}", Uuid::new_v4().simple()),
-            }))
-            .send()
-            .await
-            .expect("Square payment request failed");
-        let status = response.status();
-        let body: Value = response
-            .json()
-            .await
-            .expect("Square payment response was not JSON");
-        assert!(
-            status.is_success(),
-            "Square payment creation failed: {body}"
-        );
-        created.push(
-            body.get("payment")
-                .cloned()
-                .expect("Square response omitted the payment"),
-        );
-    }
-
-    let temp = tempfile::tempdir().unwrap();
-    let store = Store::open(temp.path()).unwrap();
-    let sync = SyncEngine::new(store.clone());
-    for transaction in &created {
-        assert!(sync.ingest_payment(transaction).await.unwrap());
-    }
-    let (transactions, _) = store
-        .list_transactions_page(50, 0, None, "", "COMPLETED")
-        .unwrap();
-    assert_eq!(transactions.len(), 10);
-    assert_eq!(
-        transactions
+        .expect("Square credentials or location read failed");
+    let location_id = locations
+        .first()
+        .and_then(|location| location.get("id"))
+        .and_then(Value::as_str);
+    let (payments, _) = square
+        .payment_page(location_id, None, None, 10)
+        .await
+        .expect("Square payment read failed");
+    // Existing accounts may have no payments. Do not create test sales or
+    // persist/print provider responses to manufacture a nonempty result.
+    assert!(
+        payments
             .iter()
-            .map(|transaction| transaction.id.as_str())
-            .collect::<HashSet<_>>()
-            .len(),
-        10
+            .all(|payment| parse_payment(payment).is_ok())
     );
-    for key in [
-        "square.access_token",
-        "protect.host",
-        "protect.username",
-        "protect.password",
-    ] {
-        assert_eq!(store.get_setting(key).unwrap(), None);
-    }
 }
 
 #[tokio::test]

@@ -13,7 +13,7 @@ use url::Url;
 use crate::{AppError, AppResult, models::PaymentFacts, store::validate_camera_id};
 
 pub const SQUARE_VERSION: &str = "2025-01-23";
-pub const SQUARE_WEBHOOK_SUBSCRIPTION_NAME: &str = "square-unifi-protect";
+const SQUARE_READ_SCOPES: [&str; 2] = ["MERCHANT_PROFILE_READ", "PAYMENTS_READ"];
 const SQUARE_PRODUCTION_URL: &str = "https://connect.squareup.com";
 const SQUARE_SANDBOX_URL: &str = "https://connect.squareupsandbox.com";
 
@@ -49,6 +49,7 @@ impl SquareClient {
         let client = Client::builder()
             .default_headers(headers)
             .timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(AppError::internal)?;
         Ok(Self {
@@ -63,19 +64,22 @@ impl SquareClient {
         method: Method,
         path: &str,
         query: &[(&str, String)],
-        body: Option<&Value>,
-        retry_idempotent: bool,
     ) -> AppResult<Value> {
+        // Keep this boundary independent of the token's permissions. Personal
+        // access tokens can write to Square, but this application cannot.
+        if method != Method::GET
+            || !matches!(path, "/v2/locations" | "/v2/merchants/me" | "/v2/payments")
+        {
+            return Err(AppError::Forbidden(
+                "Square access is read-only; this request is not permitted".into(),
+            ));
+        }
         let url = format!("{}{path}", self.base_url);
         let mut attempt = 0_u32;
         loop {
-            let mut request = self.client.request(method.clone(), &url).query(query);
-            if let Some(body) = body {
-                request = request.json(body);
-            }
-            let response = match request.send().await {
+            let response = match self.client.get(&url).query(query).send().await {
                 Ok(response) => response,
-                Err(error) if retry_idempotent && attempt < 3 => {
+                Err(error) if attempt < 3 => {
                     tracing::warn!(%error, %path, "Square request had a network error; retrying");
                     tokio::time::sleep(retry_delay(attempt, None)).await;
                     attempt += 1;
@@ -88,10 +92,7 @@ impl SquareClient {
                 }
             };
             let status = response.status();
-            if retry_idempotent
-                && attempt < 3
-                && matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504)
-            {
+            if attempt < 3 && matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504) {
                 tokio::time::sleep(retry_delay(attempt, response.headers().get("retry-after")))
                     .await;
                 attempt += 1;
@@ -121,9 +122,7 @@ impl SquareClient {
     }
 
     pub async fn list_locations(&self) -> AppResult<Vec<Value>> {
-        let payload = self
-            .request_json(Method::GET, "/v2/locations", &[], None, true)
-            .await?;
+        let payload = self.request_json(Method::GET, "/v2/locations", &[]).await?;
         object_array(&payload, "locations")?
             .iter()
             .map(|location| {
@@ -139,7 +138,7 @@ impl SquareClient {
 
     pub async fn merchant_id(&self) -> AppResult<String> {
         let payload = self
-            .request_json(Method::GET, "/v2/merchants/me", &[], None, true)
+            .request_json(Method::GET, "/v2/merchants/me", &[])
             .await?;
         let merchant = payload
             .get("merchant")
@@ -177,7 +176,7 @@ impl SquareClient {
             query.push(("cursor", value.to_owned()));
         }
         let payload = self
-            .request_json(Method::GET, "/v2/payments", &query, None, true)
+            .request_json(Method::GET, "/v2/payments", &query)
             .await?;
         let page = object_array(&payload, "payments")?.to_vec();
         let cursor = match payload.get("cursor") {
@@ -193,118 +192,6 @@ impl SquareClient {
             }
         };
         Ok((page, cursor))
-    }
-
-    pub async fn list_webhook_subscriptions(&self) -> AppResult<Vec<Value>> {
-        let mut subscriptions = Vec::new();
-        let mut cursor: Option<String> = None;
-        let mut seen = std::collections::HashSet::new();
-        for _ in 0..100 {
-            let mut query = vec![("limit", "100".into())];
-            if let Some(value) = cursor.as_ref() {
-                query.push(("cursor", value.clone()));
-            }
-            let payload = self
-                .request_json(
-                    Method::GET,
-                    "/v2/webhooks/subscriptions",
-                    &query,
-                    None,
-                    true,
-                )
-                .await?;
-            subscriptions.extend(object_array(&payload, "subscriptions")?.iter().cloned());
-            let next = payload
-                .get("cursor")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty());
-            let Some(next) = next else {
-                return Ok(subscriptions);
-            };
-            if !seen.insert(next.to_owned()) {
-                return Err(AppError::Upstream(
-                    "Square returned a repeated pagination cursor".into(),
-                ));
-            }
-            cursor = Some(next.to_owned());
-        }
-        Err(AppError::Upstream(
-            "Square webhook subscription pagination exceeded safety limit".into(),
-        ))
-    }
-
-    pub async fn create_webhook_subscription(
-        &self,
-        notification_url: &str,
-        idempotency_key: &str,
-    ) -> AppResult<Value> {
-        let body = json!({
-            "idempotency_key": idempotency_key,
-            "subscription": {
-                "name": SQUARE_WEBHOOK_SUBSCRIPTION_NAME,
-                "notification_url": notification_url,
-                "event_types": ["payment.created", "payment.updated"],
-                "api_version": SQUARE_VERSION,
-            }
-        });
-        let payload = self
-            .request_json(
-                Method::POST,
-                "/v2/webhooks/subscriptions",
-                &[],
-                Some(&body),
-                true,
-            )
-            .await?;
-        payload.get("subscription").cloned().ok_or_else(|| {
-            AppError::Upstream("Square returned an invalid webhook subscription".into())
-        })
-    }
-
-    pub async fn update_webhook_subscription(
-        &self,
-        id: &str,
-        notification_url: &str,
-    ) -> AppResult<Value> {
-        let body = json!({
-            "subscription": {
-                "notification_url": notification_url,
-                "event_types": ["payment.created", "payment.updated"],
-                "enabled": true,
-            }
-        });
-        let payload = self
-            .request_json(
-                Method::PUT,
-                &format!("/v2/webhooks/subscriptions/{id}"),
-                &[],
-                Some(&body),
-                true,
-            )
-            .await?;
-        payload.get("subscription").cloned().ok_or_else(|| {
-            AppError::Upstream("Square returned an invalid webhook subscription".into())
-        })
-    }
-
-    pub async fn webhook_signature_key(&self, id: &str) -> AppResult<String> {
-        let payload = self
-            .request_json(
-                Method::GET,
-                &format!("/v2/webhooks/subscriptions/{id}"),
-                &[],
-                None,
-                true,
-            )
-            .await?;
-        payload
-            .pointer("/subscription/signature_key")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .ok_or_else(|| {
-                AppError::Upstream("Square did not return the webhook signature key".into())
-            })
     }
 }
 
@@ -787,19 +674,19 @@ pub fn oauth_authorize_url(environment: &str, client_id: &str, state: &str) -> A
     let mut url = Url::parse(&format!("{base}/oauth2/authorize")).map_err(AppError::internal)?;
     url.query_pairs_mut()
         .append_pair("client_id", client_id)
-        .append_pair("scope", "MERCHANT_PROFILE_READ PAYMENTS_READ")
+        .append_pair("scope", &SQUARE_READ_SCOPES.join(" "))
         .append_pair("session", "false")
         .append_pair("state", state);
     Ok(url.into())
 }
 
-pub async fn oauth_exchange(
+fn oauth_token_request(
     environment: &str,
     client_id: &str,
     client_secret: &str,
     code: Option<&str>,
     refresh_token: Option<&str>,
-) -> AppResult<Value> {
+) -> AppResult<reqwest::RequestBuilder> {
     let base = square_base_url(environment)?;
     let mut body = json!({
         "client_id": client_id,
@@ -811,14 +698,33 @@ pub async fn oauth_exchange(
     } else if let Some(refresh) = refresh_token {
         body["grant_type"] = Value::String("refresh_token".into());
         body["refresh_token"] = Value::String(refresh.into());
+        body["scopes"] = json!(SQUARE_READ_SCOPES);
     } else {
         return Err(AppError::Unprocessable(
             "code or refresh_token is required".into(),
         ));
     }
-    let response = Client::new()
+    // This POST only obtains authentication tokens; it never changes Square
+    // payments or account configuration. Do not follow redirects with secrets.
+    let client = Client::builder()
+        .timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(AppError::internal)?;
+    Ok(client
         .post(format!("{base}/oauth2/token"))
-        .json(&body)
+        .header("Square-Version", SQUARE_VERSION)
+        .json(&body))
+}
+
+pub async fn oauth_exchange(
+    environment: &str,
+    client_id: &str,
+    client_secret: &str,
+    code: Option<&str>,
+    refresh_token: Option<&str>,
+) -> AppResult<Value> {
+    let response = oauth_token_request(environment, client_id, client_secret, code, refresh_token)?
         .send()
         .await
         .map_err(|error| {
@@ -1045,7 +951,6 @@ fn is_complete_jpeg(content: &[u8]) -> bool {
 mod tests {
     use super::*;
     use axum::{Router, body::Body, http::Request, response::IntoResponse, routing::any};
-    use http_body_util::BodyExt;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -1324,8 +1229,41 @@ mod tests {
         assert_eq!(query.get("state").map(String::as_str), Some("opaque-state"));
         assert_eq!(query.get("session").map(String::as_str), Some("false"));
         let scope = query.get("scope").unwrap();
-        assert!(scope.contains("MERCHANT_PROFILE_READ"));
-        assert!(scope.contains("PAYMENTS_READ"));
+        assert_eq!(scope, "MERCHANT_PROFILE_READ PAYMENTS_READ");
+    }
+
+    #[test]
+    fn oauth_token_refresh_limits_scopes_to_reads_and_only_targets_authentication() {
+        for environment in ["production", "sandbox"] {
+            let expected_url = format!("{}/oauth2/token", square_base_url(environment).unwrap());
+            for refreshing in [false, true] {
+                let request = oauth_token_request(
+                    environment,
+                    "test-app-id",
+                    "test-app-secret",
+                    (!refreshing).then_some("test-auth-code"),
+                    refreshing.then_some("test-refresh-token"),
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+                assert_eq!(request.method(), Method::POST);
+                assert_eq!(request.url().as_str(), expected_url);
+                let body: Value =
+                    serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+                if refreshing {
+                    assert_eq!(body["grant_type"], "refresh_token");
+                    assert_eq!(
+                        body["scopes"],
+                        json!(["MERCHANT_PROFILE_READ", "PAYMENTS_READ"])
+                    );
+                    assert!(body.get("code").is_none());
+                } else {
+                    assert_eq!(body["grant_type"], "authorization_code");
+                    assert!(body.get("refresh_token").is_none());
+                }
+            }
+        }
     }
 
     #[test]
@@ -1497,37 +1435,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn square_webhook_subscription_pagination_exhausts_and_detects_cycles() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let sequence = calls.clone();
-        let router = Router::new().fallback(any(move |request: Request<Body>| {
-            let sequence = sequence.clone();
-            async move {
-                let call = sequence.fetch_add(1, Ordering::SeqCst);
-                if call == 0 {
-                    assert!(!request.uri().to_string().contains("cursor="));
+    async fn square_data_requests_are_read_only_in_both_environments() {
+        for environment in ["production", "sandbox"] {
+            let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let capture = observed.clone();
+            let router = Router::new().fallback(any(move |request: Request<Body>| {
+                let capture = capture.clone();
+                async move {
+                    capture
+                        .lock()
+                        .unwrap()
+                        .push((request.method().clone(), request.uri().path().to_owned()));
                     axum::Json(json!({
-                        "subscriptions": [{"id": "SUB_1"}],
-                        "cursor": "next-page"
+                        "locations": [], "merchant": {"id": "EXAMPLE_MERCHANT"}, "payments": []
                     }))
-                } else {
-                    assert!(request.uri().to_string().contains("cursor=next-page"));
-                    axum::Json(json!({"subscriptions": [{"id": "SUB_2"}]}))
+                }
+            }));
+            let mut client = SquareClient::new("test-read-only-token", environment).unwrap();
+            client.base_url = spawn_http(router).await;
+            for method in [
+                Method::POST,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+                Method::HEAD,
+                Method::OPTIONS,
+                Method::CONNECT,
+                Method::TRACE,
+            ] {
+                for path in [
+                    "/v2/payments",
+                    "/v2/locations",
+                    "/v2/merchants/me",
+                    "/v2/refunds",
+                    "/v2/webhooks/subscriptions",
+                    "/oauth2/revoke",
+                ] {
+                    assert!(matches!(
+                        client.request_json(method.clone(), path, &[]).await,
+                        Err(AppError::Forbidden(_))
+                    ));
                 }
             }
-        }));
-        let client = square_with_router(router).await;
-        assert_eq!(client.list_webhook_subscriptions().await.unwrap().len(), 2);
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-
-        let router = Router::new().fallback(any(|| async {
-            axum::Json(json!({"subscriptions": [], "cursor": "loop"}))
-        }));
-        let looping = square_with_router(router).await;
-        assert!(matches!(
-            looping.list_webhook_subscriptions().await,
-            Err(AppError::Upstream(message)) if message.contains("repeated")
-        ));
+            for path in [
+                "/v2/webhooks/subscriptions",
+                "/v2/refunds",
+                "/oauth2/token",
+                "/v2/payments/../refunds",
+                "/v2/payments?method=DELETE",
+                "/v2/payments/EXAMPLE_PAYMENT/cancel",
+                "https://example.invalid/v2/payments",
+            ] {
+                assert!(matches!(
+                    client.request_json(Method::GET, path, &[]).await,
+                    Err(AppError::Forbidden(_))
+                ));
+            }
+            assert!(
+                observed.lock().unwrap().is_empty(),
+                "blocked requests reached the provider"
+            );
+            client.list_locations().await.unwrap();
+            client.merchant_id().await.unwrap();
+            client.payment_page(None, None, None, 10).await.unwrap();
+            assert_eq!(
+                *observed.lock().unwrap(),
+                vec![
+                    (Method::GET, "/v2/locations".into()),
+                    (Method::GET, "/v2/merchants/me".into()),
+                    (Method::GET, "/v2/payments".into()),
+                ]
+            );
+        }
     }
 
     #[tokio::test]
@@ -1588,39 +1567,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn square_webhook_writes_keep_idempotency_and_event_contracts() {
-        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let capture = bodies.clone();
-        let router = Router::new().fallback(any(move |request: Request<Body>| {
+    async fn square_read_requests_do_not_follow_redirects_outside_the_allowlist() {
+        let redirected = Arc::new(AtomicUsize::new(0));
+        let capture = redirected.clone();
+        let target = spawn_http(Router::new().fallback(any(move || {
             let capture = capture.clone();
             async move {
-                let path = request.uri().path().to_owned();
-                let body = request.into_body().collect().await.unwrap().to_bytes();
-                capture.lock().unwrap().push((
-                    path.clone(),
-                    serde_json::from_slice::<Value>(&body).unwrap(),
-                ));
-                axum::Json(json!({"subscription": {"id": "SUB_1"}}))
+                capture.fetch_add(1, Ordering::SeqCst);
+                axum::Json(json!({"locations": []}))
             }
-        }));
-        let client = square_with_router(router).await;
-        client
-            .create_webhook_subscription("https://example.test/webhooks/square", "stable-key")
-            .await
-            .unwrap();
-        client
-            .update_webhook_subscription("SUB_1", "https://example.test/webhooks/square")
-            .await
-            .unwrap();
-        let bodies = bodies.lock().unwrap();
-        assert_eq!(bodies[0].0, "/v2/webhooks/subscriptions");
-        assert_eq!(bodies[0].1["idempotency_key"], "stable-key");
-        assert_eq!(
-            bodies[0].1["subscription"]["event_types"],
-            json!(["payment.created", "payment.updated"])
-        );
-        assert_eq!(bodies[1].0, "/v2/webhooks/subscriptions/SUB_1");
-        assert_eq!(bodies[1].1["subscription"]["enabled"], true);
+        })))
+        .await;
+        for code in [301, 302, 303, 307, 308] {
+            let target = format!("{target}/v2/webhooks/subscriptions");
+            let router = Router::new().fallback(any(move || {
+                let target = target.clone();
+                async move {
+                    (
+                        StatusCode::from_u16(code).unwrap(),
+                        [(header::LOCATION, target)],
+                    )
+                }
+            }));
+            let client = square_with_router(router).await;
+            assert!(matches!(
+                client.list_locations().await,
+                Err(AppError::Upstream(_))
+            ));
+        }
+        assert_eq!(redirected.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

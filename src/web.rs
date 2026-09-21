@@ -28,9 +28,8 @@ use url::Url;
 use crate::{
     AppError, AppResult, Config, Store,
     clients::{
-        ProtectClient, SQUARE_WEBHOOK_SUBSCRIPTION_NAME, SquareClient, oauth_authorize_url,
-        oauth_exchange, validate_alarm_trigger_id, validate_protect_host,
-        verify_square_webhook_signature,
+        ProtectClient, SquareClient, oauth_authorize_url, oauth_exchange,
+        validate_alarm_trigger_id, validate_protect_host, verify_square_webhook_signature,
     },
     models::*,
     security::{BootstrapSecretVerifier, hash_password, new_session_token, verify_password},
@@ -251,7 +250,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/settings/square/webhook/register",
-            post(register_square_webhook),
+            post(square_webhook_registration_disabled),
         )
         .route("/api/settings/square/oauth-app", put(set_square_oauth_app))
         .route("/oauth/square/start", get(square_oauth_start))
@@ -1237,52 +1236,14 @@ async fn thumbnail_settings_value(state: &AppState) -> AppResult<Value> {
     }))
 }
 
-async fn register_square_webhook(
+async fn square_webhook_registration_disabled(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<WebhookRegisterBody>,
 ) -> AppResult<Response> {
     require_admin(&state, &headers)?;
-    let _provider_guard = state.store.integration_guard(false)?;
-    let url = validate_https_url(&body.notification_url)?;
-    let square = state
-        .sync
-        .square_client()
-        .await?
-        .ok_or_else(|| AppError::Conflict("Square is not configured".into()))?;
-    let subscriptions = square.list_webhook_subscriptions().await?;
-    let existing = subscriptions.iter().find(|subscription| {
-        subscription.get("name").and_then(Value::as_str) == Some(SQUARE_WEBHOOK_SUBSCRIPTION_NAME)
-    });
-    let subscription = if let Some(existing) = existing {
-        let id = existing
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AppError::Upstream("Square webhook subscription had no id".into()))?;
-        square.update_webhook_subscription(id, &url).await?
-    } else {
-        square
-            .create_webhook_subscription(&url, &uuid::Uuid::new_v4().to_string())
-            .await?
-    };
-    let id = subscription
-        .get("id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| AppError::Upstream("Square webhook subscription had no id".into()))?;
-    let key = square.webhook_signature_key(id).await?;
-    state.store.update_settings(
-        &[
-            ("square.webhook_signature_key", &key, true),
-            ("square.webhook_url", &url, false),
-            ("square.webhook_subscription_id", id, false),
-        ],
-        &[],
-    )?;
-    Ok(json_response(json!({
-        "ok": true,
-        "subscription_id": id,
-        "notification_url": url,
-    })))
+    Err(AppError::Forbidden(
+        "Square access is read-only. Configure webhook subscriptions in the Square Developer Console, then save the signature key and notification URL locally.".into(),
+    ))
 }
 
 async fn set_square_oauth_app(
@@ -2987,6 +2948,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn square_webhook_registration_is_forbidden_even_for_admins() {
+        for environment in ["production", "sandbox"] {
+            let temp = tempfile::tempdir().unwrap();
+            let (state, cookie) = authenticated_state(temp.path().to_owned());
+            state
+                .store
+                .set_setting("square.environment", environment, false)
+                .unwrap();
+            state
+                .store
+                .set_setting(
+                    "square.webhook_signature_key",
+                    "test-existing-signature",
+                    true,
+                )
+                .unwrap();
+            state
+                .store
+                .set_setting(
+                    "square.webhook_url",
+                    "https://example.com/webhooks/square",
+                    false,
+                )
+                .unwrap();
+            let app = build_router(state.clone());
+            let response = app
+                .oneshot(http_request(
+                    "POST",
+                    "/api/settings/square/webhook/register",
+                    json!({"notification_url": "https://example.com/replacement"}),
+                    Some(&cookie),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let body = response_json_value(response).await;
+            assert!(body.to_string().contains("read-only"));
+            assert_eq!(
+                state
+                    .store
+                    .get_setting("square.webhook_signature_key")
+                    .unwrap()
+                    .as_deref(),
+                Some("test-existing-signature")
+            );
+            assert_eq!(
+                state
+                    .store
+                    .get_setting("square.webhook_url")
+                    .unwrap()
+                    .as_deref(),
+                Some("https://example.com/webhooks/square")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn browser_auth_contract_and_role_boundaries() {
         let temp = tempfile::tempdir().unwrap();
         let app = build_router(test_state(temp.path().to_owned()));
@@ -3112,6 +3130,7 @@ mod tests {
             ("GET", "/api/health/protect"),
             ("GET", "/api/cameras"),
             ("GET", "/api/health/square"),
+            ("POST", "/api/settings/square/webhook/register"),
             ("GET", "/api/locations"),
             ("GET", "/api/pos-devices"),
             ("GET", "/api/camera-preview/abc123"),

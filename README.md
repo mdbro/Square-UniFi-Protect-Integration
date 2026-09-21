@@ -15,6 +15,10 @@ timeline near that timestamp.
 - **Connect your Square account** — enter a Square access token in the companion
   app (production or sandbox); the integration verifies it against the Square
   API before saving.
+- **Read-only Square access** — the app only reads merchant details, locations,
+  and payments in both production and Sandbox. It cannot create, update, cancel,
+  or refund payments, or manage Square webhook subscriptions. Notes and camera
+  mappings are stored locally, and incoming Square webhooks remain supported.
 - **Connect your UniFi Protect console** — local-account credentials for your
   UniFi OS console (Dream Machine, NVR, etc.), verified on save.
 - **Choose the POS camera per register** — map each observed Square POS device
@@ -161,11 +165,16 @@ Then:
    seen on a successful reconnect; every later mismatch requires a confirmed reset.
    If a Protect version never reports an NVR id or MAC, the saved host string is
    the only available identity boundary.
-3. **Settings → Square account** — a Square access token
-   (Developer Dashboard → your application → Credentials). Optionally add your
-   webhook signature key and notification URL for real-time ingestion
-   (subscribe the webhook to both `payment.created` and `payment.updated`, pointing at
-   `https://<your-host>:3546/webhooks/square`). Existing installations must reconnect
+3. **Settings → Square account** — use **Connect with Square** for an OAuth
+   connection requesting only `MERCHANT_PROFILE_READ` and `PAYMENTS_READ`, or
+   paste an access token manually. A personal access token has broader
+   permissions in Square, but the app still enforces read-only requests.
+   Optionally configure a webhook in the Square Developer Console, then save
+   its signature key and notification URL locally for real-time ingestion.
+   Subscribe to both `payment.created` and `payment.updated`, pointing at
+   `https://<your-host>:3546/webhooks/square`. The app does not create or update
+   Square subscriptions; polling also works without a webhook.
+   Existing installations must reconnect
    Square once after upgrading so webhook events can be bound to that merchant.
    Changing the merchant or switching between Sandbox and Production requires
    confirmation and clears the previous account's local transactions, camera
@@ -385,15 +394,37 @@ behind the authenticated interface.
 
 ## FAQ
 
+**Can the app write to Square?** No Square business-data or configuration writes
+are supported. The Square data client accepts only `GET /v2/locations`,
+`GET /v2/merchants/me`, and `GET /v2/payments`; other methods and paths fail
+before a network request, and redirects are not followed. The former automatic
+webhook registration endpoint returns `403` even for administrators. There is
+no setting to enable Square writes, including in Sandbox.
+
+OAuth sign-in and token refresh use Square's authentication-only
+`POST /oauth2/token` endpoint. Authorization requests only
+`MERCHANT_PROFILE_READ` and `PAYMENTS_READ`, and refresh requests explicitly
+limit the new access token to those same permissions. These authentication
+requests do not change payments or account configuration.
+
+For Square to enforce read-only permissions on the credential itself, use
+**Connect with Square** or an OAuth token scoped to those two read permissions.
+[Personal access tokens have unrestricted permissions in Square](https://developer.squareup.com/docs/build-basics/access-tokens);
+the app's request restrictions do not narrow a personal token's permissions
+when that token is used by other software. Existing token permissions are not
+revoked or changed by this upgrade. See Square's
+[OAuth permission reference](https://developer.squareup.com/docs/oauth-api/square-permissions)
+and [token refresh scope rules](https://developer.squareup.com/reference/square/oauth-api/obtain-token).
+
 **Do I need the Square "Application ID" (or "Sandbox Application ID")?**
 Only if you use the "Connect with Square" (OAuth) sign-in, where it serves as
 the OAuth client id. If you paste an access token manually instead, the
 Application ID is not needed: it identifies your *application* in OAuth
 authorization flows and in Square's client-side SDKs (such as the Web Payments
 SDK that renders card forms in a browser), while this integration's
-server-side Payments/Locations/Webhook API calls authenticate with the
-**access token** alone. For manual setup, copy the access token from the same
-Credentials page and ignore the Application ID.
+server-side merchant, location, and payment reads authenticate with the
+**access token** alone. Use a read-scoped OAuth token when you want Square to
+enforce the permission limit as well as the app.
 
 **Sandbox or Production?** Use the Sandbox token (and select *Sandbox* in
 Settings) to trial the integration with fake payments you create from the
@@ -425,8 +456,10 @@ security, packaging, browser-contract, TLS, and concurrency tests run locally
 without real Square or UniFi credentials. Passing tests do not validate
 firmware-specific snapshot or timeline behavior on real hardware.
 
-The opt-in live-provider suite creates exactly ten completed Square Sandbox
-payments and verifies both motion-correlation outcomes using a camera selected
+The opt-in live-provider suite reads existing Square merchant details,
+locations, and up to ten payments; an account with no payments is valid. It
+never creates payments or changes subscriptions, in either environment.
+It also verifies both motion-correlation outcomes using a camera selected
 at runtime. The Protect tests confirm that the configured credentials can list
 that camera, then inject a webhook directly into the in-process application.
 They do not test outbound delivery from the Protect console, DNS, routing, TLS,
@@ -439,7 +472,8 @@ scripts/run-live-provider-tests.sh
 ```
 
 The live tests are ignored by the normal `cargo test` commands. They accept
-`SPI_TEST_SQUARE_ACCESS_TOKEN`, `SPI_TEST_PROTECT_HOST`,
+`SPI_TEST_SQUARE_ACCESS_TOKEN`, `SPI_TEST_SQUARE_ENVIRONMENT` (`production` by
+default, or `sandbox`), `SPI_TEST_PROTECT_HOST`,
 `SPI_TEST_PROTECT_USERNAME`, `SPI_TEST_PROTECT_PASSWORD`, and
 `SPI_TEST_PROTECT_CAMERA_NAME` from the process environment when a
 non-interactive secret runner already provides them. Never put those values in

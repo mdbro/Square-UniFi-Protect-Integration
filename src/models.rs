@@ -95,11 +95,6 @@ pub struct CameraMappingBody {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct WebhookRegisterBody {
-    pub notification_url: String,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct DiscoverProtectBody {
     #[serde(default)]
     pub host: String,
